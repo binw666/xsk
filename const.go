@@ -1,0 +1,14 @@
+package xsk
+
+const (
+	XSK_RING_CONS__DEFAULT_NUM_DESCS           = 2048
+	XSK_RING_PROD__DEFAULT_NUM_DESCS           = 2048
+	XSK_UMEM__DEFAULT_FRAME_SHIFT              = 12
+	XSK_UMEM__DEFAULT_FRAME_SIZE               = (1 << XSK_UMEM__DEFAULT_FRAME_SHIFT)
+	XSK_UMEM__DEFAULT_FRAME_HEADROOM           = 0
+	XSK_UMEM__DEFAULT_FLAGS                    = 0
+	XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD uint32 = (1 << 0)
+	INIT_NS                                    = 1
+	XSK_UNALIGNED_BUF_OFFSET_SHIFT             = 48
+	XSK_UNALIGNED_BUF_ADDR_MASK                = (1 << XSK_UNALIGNED_BUF_OFFSET_SHIFT) - 1
+)
