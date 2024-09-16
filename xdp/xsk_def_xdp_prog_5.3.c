@@ -15,11 +15,6 @@ struct {
 	__uint(max_entries, DEFAULT_QUEUE_IDS);
 } xsks_map SEC(".maps");
 
-struct {
-	__uint(priority, 20);
-	__uint(XDP_PASS, 1);
-} XDP_RUN_CONFIG(xsk_def_prog);
-
 /* Program refcount, in order to work properly,
  * must be declared before any other global variables
  * and initialized with '1'.
@@ -28,7 +23,7 @@ volatile int refcnt = 1;
 
 /* This is the program for 5.3 kernels and older. */
 SEC("xdp")
-int xsk_def_prog(struct xdp_md *ctx)
+int __attribute__((btf_decl_tag("entry_func"))) xsk_def_prog(struct xdp_md *ctx)
 {
 	int index = ctx->rx_queue_index;
 

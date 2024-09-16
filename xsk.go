@@ -320,7 +320,7 @@ func XskSocketDelete(xsk *XskSocket) {
 	ctx := xsk.Ctx
 	umem := ctx.Umem
 	if ctx.XdpProg != nil {
-		xskDeleteMapEntry(ctx.XsksMapFd, ctx.QueueId)
+		xskDeleteMapEntry(ctx.XsksMap, ctx.QueueId)
 		xskReleaseXdpProg(xsk)
 	}
 

@@ -5,6 +5,7 @@ import (
 	"unsafe"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 )
 
 /*
@@ -102,9 +103,9 @@ type XskCtx struct {
 	Refcount    int
 	Ifindex     int
 	NetnsCookie uint64
-	XsksMapFd   int
+	XsksMap     *ebpf.Map
 	XdpProg     *ebpf.Program
-	RefcntMapFd int
+	RefcntMap   *ebpf.Map
 	Ifname      string
 }
 
@@ -149,7 +150,7 @@ type XskSocketConfig struct {
 	RxSize      uint32
 	TxSize      uint32
 	LibbpfFlags uint32
-	XdpFlags    uint32
+	XdpFlags    link.XDPAttachFlags
 	BindFlags   uint16
 }
 

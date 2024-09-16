@@ -26,3 +26,6 @@ make
 make install
 
 ```
+
+
+TODO: C代码更改，支持锁，一边内核态可锁定
