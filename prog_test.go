@@ -49,13 +49,27 @@ func TestAdd(t *testing.T) {
 		t.Fatal(err)
 	}
 	fmt.Println(info)
+	maps, has := info.MapIDs()
+	// 这里与libbpf的实现不同，libbpf会使用 BPF 对象名称的前 8 个字符加上一个表示内部映射类型的后缀，例如 "xdp_def_" + ".data"。
+	// 而这里，只有 .data
+	if has {
+		for _, id := range maps {
+			mapObj, err := ebpf.NewMapFromID(ebpf.MapID(id))
+			if err != nil {
+				t.Fatal(err)
+			}
+			fmt.Println(mapObj)
+			fmt.Println(mapObj.Info())
+		}
+	}
+
 	btfID, has := info.BTFID()
 	if has {
 		handle, err := btf.NewHandleFromID(btfID)
 		if err != nil {
 			t.Fatal(err)
 		}
-		spec, err := handle.Spec(&btf.Spec{})
+		spec, err := handle.Spec(nil)
 		if err != nil {
 			t.Fatal(err)
 		}
