@@ -8,10 +8,7 @@
 # 注意
 
 - 内核版本 <= 5.3 的系统中，getsocketopt 没有 flag 字段，需要进一步处理，这里暂不支持 <= 5.3 的内核（相关函数 xskGetMmapOffsets）
-
-# TODO
-
-- [ ] xskSetupXdpProg 函数的实现（目前遇到问题：使用 ebpf 库加载 xdp 程序时，BTF 信息不完整，暂未找到解决方法）
+- 内核版本 <= 5.3 的系统中，`bpf_redirect_map` 的函数与之后的定义冲突，未实现检测方法，这里暂不支持 <= 5.3 的内核（相关函数 XskSetupXdpProg）
 
 # 依赖
 ```c
@@ -27,5 +24,6 @@ make install
 
 ```
 
+# 示例
 
-TODO: C代码更改，支持锁，一边内核态可锁定
+参考 `example` 文件夹中的 `pktgen` 和 `pktRecv`
