@@ -1,6 +1,9 @@
 package xsk
 
 import (
+	"encoding/binary"
+	"fmt"
+	"log"
 	"strings"
 	"unsafe"
 
@@ -8,6 +11,8 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/vishvananda/netlink"
 )
+
+const LinkPath = "/sys/fs/bpf/xsk_def_xdp_prog_"
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS xsk_def_xdp_prog ./xdp/xsk_def_xdp_prog.c
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS xsk_def_xdp_prog_5_3 ./xdp/xsk_def_xdp_prog_5.3.c
@@ -52,15 +57,14 @@ func xskLookupMap(prog *ebpf.Program, mapInfoFilter func(*ebpf.MapInfo) bool) (*
 			if err != nil {
 				continue
 			}
+			defer mapObj.Close()
 			mapInfo, err := mapObj.Info()
 			if err != nil {
-				mapObj.Close()
 				continue
 			}
 			if mapInfoFilter(mapInfo) {
-				return mapObj, nil
+				return mapObj.Clone()
 			}
-			mapObj.Close()
 		}
 	}
 	return nil, nil
@@ -79,7 +83,7 @@ func xskUpdateProgRefcnt(refcntMap *ebpf.Map, delta int) (int, error) {
 	var ret int = -1
 	var key uint32 = 0
 	var valueData []byte
-	var value *int
+	var value int
 	lockFile, err := xdpLockAcquire()
 	if err != nil {
 		goto out
@@ -94,17 +98,18 @@ func xskUpdateProgRefcnt(refcntMap *ebpf.Map, delta int) (int, error) {
 		goto unlock
 	}
 
-	value = (*int)(unsafe.Pointer(&valueData[0]))
+	value = int(binary.LittleEndian.Uint32(valueData))
 	/* If refcount is 0, program is awaiting detach and can't be used */
-	if *value != 0 {
-		*value += delta
+	if value != 0 {
+		value += delta
+		binary.LittleEndian.PutUint32(valueData, uint32(value))
 		err := refcntMap.Update(&key, valueData, ebpf.UpdateAny)
 		if err != nil {
 			goto unlock
 		}
 	}
 
-	ret = *value
+	ret = value
 unlock:
 	xdpLockRelease(lockFile)
 out:
@@ -124,6 +129,10 @@ func xskSetupXdpProg(xsk *XskSocket, xsksMap **ebpf.Map) error {
 	ctx := xsk.Ctx
 	attached := false
 	var err error
+	var bpfInfo *ebpf.ProgramInfo
+	var bpfID ebpf.ProgramID
+	var supportProgID bool
+	var l link.Link
 
 	ifLink, err := netlink.LinkByIndex(ctx.Ifindex)
 	if err != nil {
@@ -155,7 +164,13 @@ func xskSetupXdpProg(xsk *XskSocket, xsksMap **ebpf.Map) error {
 			ctx.RefcntMap = nil
 			ctx.XdpProg.Close()
 			ctx.XdpProg = nil
-			netlink.LinkSetXdpFd(ifLink, -1)
+			// 解除之前的 hook
+			l, err = link.LoadPinnedLink(fmt.Sprint(LinkPath, ifLink.Attrs().Xdp.ProgId), nil)
+			if err != nil {
+				log.Println(err)
+			}
+			l.Unpin()
+			l.Close()
 		}
 	}
 
@@ -165,6 +180,7 @@ func xskSetupXdpProg(xsk *XskSocket, xsksMap **ebpf.Map) error {
 		if err != nil {
 			return err
 		}
+		// 获取最大RX队列
 		channel, err := GetEthChannels(ctx.Ifname)
 		if err != nil {
 			return err
@@ -177,15 +193,31 @@ func xskSetupXdpProg(xsk *XskSocket, xsksMap **ebpf.Map) error {
 		if err != nil {
 			return err
 		}
-		ctx.XdpProg = obj.XskDefProg
-		_, err = link.AttachXDP(link.XDPOptions{
-			Program:   obj.XskDefProg,
+		defer obj.Close()
+		ctx.XdpProg, err = obj.XskDefProg.Clone()
+		if err != nil {
+			goto err_prog_load
+		}
+		bpfInfo, err = ctx.XdpProg.Info()
+		if err != nil {
+			goto err_prog_load
+		}
+		if bpfID, supportProgID = bpfInfo.ID(); !supportProgID {
+			goto err_prog_load
+		}
+
+		l, err := link.AttachXDP(link.XDPOptions{
+			Program:   ctx.XdpProg,
 			Interface: ctx.Ifindex,
 			Flags:     xsk.Config.XdpFlags,
 		})
 		if err != nil {
 			goto err_prog_load
 		}
+		if l.Pin(fmt.Sprint(LinkPath, bpfID)) != nil {
+			goto err_prog_load
+		}
+		l.Close()
 		attached = true
 
 	}
@@ -209,13 +241,18 @@ map_lookup:
 	}
 
 	if xsksMap != nil {
-		*xsksMap = ctx.XsksMap
+		*xsksMap, _ = ctx.XsksMap.Clone()
 	}
 	return nil
 
 err_lookup:
 	if attached {
-		netlink.LinkSetXdpFd(ifLink, -1)
+		l, err = link.LoadPinnedLink(fmt.Sprint(LinkPath, ifLink.Attrs().Xdp.ProgId), nil)
+		if err != nil {
+			log.Println(err)
+		}
+		l.Unpin()
+		l.Close()
 	}
 
 err_prog_load:
@@ -228,35 +265,43 @@ err_prog_load:
 	return err
 }
 
-// 对应函数 xsk_delete_map_entry
-func xskDeleteMapEntry(xsksMap *ebpf.Map, queueID uint32) error {
-	err := xsksMap.Delete(&queueID)
-	if err != nil {
-		return err
-	}
-	xsksMap.Close()
-	return nil
-}
-
 // 对应函数 xsk_release_xdp_prog
 func xskReleaseXdpProg(xsk *XskSocket) {
-	// TODO: 待实现
-	panic("implement me")
+	var ifLink netlink.Link
+	var err error
+	var value int
+	var l link.Link
+	ctx := xsk.Ctx
+
+	if ctx.RefcntMap == nil {
+		goto out
+	}
+
+	value, err = xskDecrProgRefcnt(ctx.RefcntMap)
+	ctx.RefcntMap.Close()
+	ctx.RefcntMap = nil
+	if err != nil {
+		goto out
+	}
+
+	if value != 0 {
+		goto out
+	}
+
+	ifLink, err = netlink.LinkByIndex(ctx.Ifindex)
+	if err != nil {
+		goto out
+	}
+
+	l, err = link.LoadPinnedLink(fmt.Sprint(LinkPath, ifLink.Attrs().Xdp.ProgId), nil)
+	if err != nil {
+		log.Println(err)
+	}
+
+	l.Unpin()
+	l.Close()
+
+out:
+	ctx.XdpProg.Close()
+	ctx.XdpProg = nil
 }
-
-// func xskLookupProgram(ifindex int) (*ebpf.Program, error) {
-// 	versionName := "xsk_prog_version"
-// 	progName := "xsk_def_prog"
-
-// 	// libxdp 实现了多程序挂载，这里需要看一下libxdp实现的方法
-// 	link, err := netlink.LinkByIndex(20)
-// 	if err != nil {
-// 		return nil, nil
-// 	}
-// 	fmt.Println(link)
-// 	prog, err := ebpf.NewProgramFromID(ebpf.ProgramID(link.Attrs().Xdp.ProgId))
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	info := prog.Info()
-// }
