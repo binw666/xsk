@@ -52,8 +52,7 @@ func findBpffs() (string, error) {
 
 	mnt, err := bpfFindMntptSingle(envDir, mount)
 	if err != nil {
-		fmt.Printf("No bpffs found at %s\n", envDir)
-		return "", err
+		return "", fmt.Errorf("No bpffs found at %s\n", envDir)
 	} else {
 		bpfMntCached = true
 		bpfWrkDir = mnt
@@ -184,7 +183,7 @@ func xdpLockRelease(lockFile *os.File) error {
 		return fmt.Errorf("couldn't unlock fd %d: %w", lockFile.Fd(), err)
 	}
 
-	fmt.Printf("Released lock fd %d\n", lockFile.Fd())
+	// fmt.Printf("Released lock fd %d\n", lockFile.Fd())
 	lockFile.Close()
 	return nil
 }

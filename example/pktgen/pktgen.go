@@ -10,6 +10,7 @@ import (
 	"unsafe"
 
 	"github.com/binw666/xsk"
+	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
 )
 
@@ -78,7 +79,7 @@ func main() {
 		socket, err := xsk.XskSocketCreate(iface, uint32(queueID), umem, &rx, &tx, &xsk.XskSocketConfig{
 			RxSize:      uint32(NumFrames / 2),
 			TxSize:      uint32(NumFrames / 2),
-			XdpFlags:    uint32(0),
+			XdpFlags:    link.XDPGenericMode,
 			BindFlags:   unix.XDP_USE_NEED_WAKEUP,
 			LibbpfFlags: uint32(xsk.XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD),
 		})
