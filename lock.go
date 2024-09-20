@@ -34,7 +34,14 @@ func mkStateSubdir(parent string) (string, error) {
 	return dir, nil
 }
 
-// findBpffs attempts to locate the BPF filesystem mount point.
+// findBpffs 尝试找到 BPF 文件系统的挂载点。
+// 它首先检查挂载点是否已缓存，如果可用则返回它。
+// 如果没有缓存，它会检查环境变量以确定是否应该挂载文件系统以及在哪里查找它。
+// 然后它尝试找到挂载点，如果成功则缓存结果。
+//
+// 返回值:
+// - 表示 BPF 文件系统挂载点的字符串。
+// - 如果找不到挂载点，则返回错误。
 func findBpffs() (string, error) {
 	if bpfMntCached {
 		return bpfWrkDir, nil
@@ -52,7 +59,7 @@ func findBpffs() (string, error) {
 
 	mnt, err := bpfFindMntptSingle(envDir, mount)
 	if err != nil {
-		return "", fmt.Errorf("No bpffs found at %s\n", envDir)
+		return "", fmt.Errorf("no bpffs found at %s", envDir)
 	} else {
 		bpfMntCached = true
 		bpfWrkDir = mnt
@@ -79,7 +86,16 @@ func bpfIsValidMntpt(mnt string) bool {
 	return true
 }
 
-// bpfFindMntptSingle is a placeholder for the logic to find the BPF mount point.
+// bpfFindMntptSingle 尝试在指定目录找到 BPF 文件系统挂载点。
+// 如果该目录不是有效的 BPF 挂载点且 mount 标志为 true，它将尝试在指定目录挂载一个新的 BPF 文件系统。
+//
+// 参数:
+//   - dir: 要检查的目录是否为 BPF 文件系统挂载点。
+//   - mount: 一个布尔标志，指示如果未找到 BPF 文件系统是否挂载新的 BPF 文件系统。
+//
+// 返回值:
+//   - 如果目录是有效的 BPF 挂载点或成功挂载了新的 BPF 文件系统，则返回表示该目录的字符串。
+//   - 如果目录不是有效的 BPF 挂载点且挂载新的 BPF 文件系统失败，则返回错误。
 func bpfFindMntptSingle(dir string, mount bool) (string, error) {
 	if !bpfIsValidMntpt(dir) {
 		if !mount {
@@ -95,6 +111,15 @@ func bpfFindMntptSingle(dir string, mount bool) (string, error) {
 	return dir, nil
 }
 
+// bpfMntFs 尝试在指定的目标目录挂载 BPF 文件系统。
+// 它首先尝试将目标目录变为私有挂载点。如果失败并返回 EINVAL 错误，它会尝试在目标目录上进行绑定挂载，并重试将其设为私有。
+// 一旦目标目录成为私有挂载点，它会以 0700 模式挂载 BPF 文件系统。
+//
+// 参数:
+//   - target: 要挂载 BPF 文件系统的目录。
+//
+// 返回值:
+//   - error: 如果任何挂载操作失败，则返回错误，否则返回 nil。
 func bpfMntFs(target string) error {
 	bindDone := false
 
@@ -125,7 +150,10 @@ retry:
 	return nil
 }
 
-// getBpffsDir retrieves the directory for storing state.
+// getBpffsDir 函数用于获取 BPF 文件系统目录。
+// 它首先调用 findBpffs 函数查找父目录，如果失败则返回错误。
+// 然后调用 mkStateSubdir 函数在父目录下创建子目录，如果失败则返回错误。
+// 最后返回创建的 BPF 文件系统目录路径。
 func getBpffsDir() (string, error) {
 	parent, err := findBpffs()
 	if err != nil {
@@ -140,7 +168,9 @@ func getBpffsDir() (string, error) {
 	return bpffs_dir, nil
 }
 
-// getLockDir retrieves the directory for locks, falling back to /run if necessary.
+// getLockDir 尝试使用 getBpffsDir 检索 BPF 文件系统目录。
+// 如果成功，它返回目录路径。如果 getBpffsDir 失败，它会在 RUNDIR 下创建一个子目录
+// 使用 mkStateSubdir 并返回新创建的子目录的路径。如果创建子目录失败，它会返回一个错误。
 func getLockDir() (string, error) {
 	dir, err := getBpffsDir()
 	if err == nil {
@@ -154,7 +184,12 @@ func getLockDir() (string, error) {
 	return rundir, nil
 }
 
-// xdpLockAcquire acquires an exclusive lock on the directory.
+// xdpLockAcquire 尝试获取目录上的排他锁。
+// 它返回锁定目录的文件描述符，如果发生任何错误，则返回错误。
+//
+// 返回值:
+// - *os.File: 锁定目录的文件描述符。
+// - error: 如果无法获取锁或打开目录时出现问题，则返回错误。
 func xdpLockAcquire() (*os.File, error) {
 	dir, err := getLockDir()
 	if err != nil {
@@ -176,7 +211,16 @@ func xdpLockAcquire() (*os.File, error) {
 	return lockFile, nil
 }
 
-// xdpLockRelease releases the lock on the directory.
+// xdpLockRelease 释放指定锁文件上的文件锁。
+//
+// 参数:
+//   - lockFile (*os.File): 要释放锁的文件。
+//
+// 返回值:
+//   - error: 如果解锁操作失败，则返回错误，否则返回 nil。
+//
+// 此函数使用 unix.Flock 系统调用来释放与提供的 lockFile 关联的文件描述符上的锁。
+// 如果解锁操作成功，则关闭该文件。如果解锁操作失败，则返回一个格式化的错误消息，指示失败。
 func xdpLockRelease(lockFile *os.File) error {
 	err := unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
 	if err != nil {
