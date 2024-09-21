@@ -211,8 +211,12 @@ func xskSetupXdpProg(xsk *XskSocket, xsksMap **ebpf.Map) error {
 		if err != nil {
 			return err
 		}
+		maxQueue := channel.MaxRX
+		if maxQueue == 0 {
+			maxQueue = channel.MaxCombined
+		}
 		if myMapSpec, ok := spec.Maps["xsks_map"]; ok {
-			myMapSpec.MaxEntries = channel.MaxRX
+			myMapSpec.MaxEntries = maxQueue
 		}
 		obj := xsk_def_xdp_progObjects{}
 		err = spec.LoadAndAssign(&obj, nil)
