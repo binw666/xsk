@@ -1,9 +1,9 @@
-module pktgen
+module pktGen
 
 go 1.21.0
 
 require (
-	github.com/binw666/xsk v0.0.2
+	github.com/binw666/xsk v0.0.4
 	golang.org/x/sys v0.21.0
 )
 

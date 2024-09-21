@@ -1,5 +1,5 @@
-github.com/binw666/xsk v0.0.2 h1:oxFHBPmGayU+SlpUwjQkkkXYHhJ6oOCSWw08ocohaAc=
-github.com/binw666/xsk v0.0.2/go.mod h1:czRZhMx2QV1JScfDfeKXq8c7cIjk0PC6SVLwhsI/NOM=
+github.com/binw666/xsk v0.0.4 h1:qvGoYcU/DyZq4Ivtw7S3GGqevPumecyzmcsUKl97px4=
+github.com/binw666/xsk v0.0.4/go.mod h1:czRZhMx2QV1JScfDfeKXq8c7cIjk0PC6SVLwhsI/NOM=
 github.com/cilium/ebpf v0.16.0 h1:+BiEnHL6Z7lXnlGUsXQPPAE7+kenAd4ES8MQ5min0Ok=
 github.com/cilium/ebpf v0.16.0/go.mod h1:L7u2Blt2jMM/vLAVgjxluxtBKlz3/GWjB0dMOEngfwE=
 github.com/go-quicktest/qt v1.101.0 h1:O1K29Txy5P2OK0dGo59b7b0LR6wKfIhttaAhHUyn7eI=
