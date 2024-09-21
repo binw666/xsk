@@ -21,11 +21,11 @@ type SimpleXsk struct {
 	umemArea             []byte
 	config               SimpleXskConfig
 	recvPktChan          chan []byte
+	sendPktChan          chan []byte
 	stopRecvReadFd       int
 	stopRecvWriteFd      int
 	stopSendReadFd       int
 	stopSendWriteFd      int
-	sendPktChan          chan []byte
 	recvStopFinishedChan chan struct{}
 	sendStopNoticeChan   chan struct{}
 }
@@ -43,6 +43,27 @@ func (simpleXsk *SimpleXsk) populateFillRing() {
 	XskRingProdSubmit(&simpleXsk.fill, nb)
 }
 
+// StartRecv 初始化并启动一个 goroutine 从 XSK (eXpress Data Path Socket) 接收数据包。
+// 它返回一个 chan ,通过该 chan 发送接收到的数据包。
+// 注意：不要关闭返回的 chan，如想停止接收数据包，请调用 StopRecv 函数！！！
+//
+// 参数:
+// - chanBuffSize: 用于发送接收到的数据包的通道的缓冲区大小。
+// - pollTimeout: 用于等待数据包接收或停止信号的 poll 系统调用的超时值（以毫秒为单位），-1 表示阻塞。
+//
+// 返回值:
+// - 一个只接收字节切片（[]byte）的通道，每个切片代表一个接收到的数据包。
+//
+// 该函数执行以下步骤:
+// 1. 检查接收数据包通道 (recvPktChan) 是否已初始化。如果是，则返回现有通道。
+// 2. 初始化接收数据包通道 (recvPktChan) 和一个用于信号接收停止过程完成的通道 (recvStopFinishedChan)。
+// 3. 创建一个管道来处理停止信号。
+// 4. 启动一个 goroutine：
+//   - 不断从 XSK 环形缓冲区接收数据包。
+//   - 将接收到的数据包复制到字节切片中，并通过 recvPktChan 通道发送它们。
+//   - 将描述符释放回 XSK 环形缓冲区并重新填充填充环。
+//   - 使用 poll 系统调用等待数据包接收或停止信号。
+//   - 收到停止信号时退出循环并关闭通道。
 func (simpleXsk *SimpleXsk) StartRecv(chanBuffSize int32, pollTimeout int) <-chan []byte {
 	if simpleXsk.recvPktChan != nil {
 		return simpleXsk.recvPktChan
@@ -61,6 +82,8 @@ func (simpleXsk *SimpleXsk) StartRecv(chanBuffSize int32, pollTimeout int) <-cha
 	go func() {
 		defer r.Close()
 		defer w.Close()
+		defer close(simpleXsk.recvStopFinishedChan)
+		defer close(simpleXsk.recvPktChan)
 		for {
 			pos := uint32(0)
 			nPkts := XskRingConsPeek(&simpleXsk.rx, uint32(simpleXsk.config.NumFrames/2), &pos)
@@ -83,9 +106,6 @@ func (simpleXsk *SimpleXsk) StartRecv(chanBuffSize int32, pollTimeout int) <-cha
 			unix.Poll(pollFds, pollTimeout)
 			if pollFds[1].Revents&unix.POLLIN != 0 {
 				// 收到停止信号
-				close(simpleXsk.recvPktChan)
-				simpleXsk.recvPktChan = nil
-				close(simpleXsk.recvStopFinishedChan)
 				return
 			}
 		}
@@ -98,6 +118,7 @@ func (simpleXsk *SimpleXsk) StopRecv() {
 		unix.Write(simpleXsk.stopRecvWriteFd, []byte{1})
 		<-simpleXsk.recvStopFinishedChan
 		simpleXsk.recvStopFinishedChan = nil
+		simpleXsk.recvPktChan = nil
 	}
 }
 
@@ -110,6 +131,19 @@ func (simpleXsk *SimpleXsk) recycleCompRing() {
 	XskRingConsRelease(&simpleXsk.comp, nPkts)
 }
 
+// StartSend 初始化并启动一个 goroutine 用于通过 SimpleXsk 实例发送数据包。
+// 它创建用于数据包发送和停止通知的通道，设置用于信号的文件描述符，并使用 XDP 套接字 (Xsk) 环管理数据包的传输。
+// 注意：不要关闭返回的 chan，如想停止发送数据包，请调用 StopSend 函数！！！
+//
+// 参数:
+// - chanBuffSize: 发送数据包通道的缓冲区大小。
+// - pollTimeout: 轮询文件描述符的超时值。
+//
+// 返回值:
+// - 一个发送数据包通道 (chan<- []byte)，通过该通道可以发送数据包。
+//
+// 该函数确保发送数据包通道只创建一次。它还处理完成环的回收、预留和提交传输描述符，以及轮询发送或停止信号的准备情况。
+// goroutine 在收到停止信号或发送数据包通道被外部关闭时退出。
 func (simpleXsk *SimpleXsk) StartSend(chanBuffSize int32, pollTimeout int) chan<- []byte {
 	if simpleXsk.sendPktChan != nil {
 		return simpleXsk.sendPktChan
@@ -128,13 +162,14 @@ func (simpleXsk *SimpleXsk) StartSend(chanBuffSize int32, pollTimeout int) chan<
 	go func() {
 		defer r.Close()
 		defer w.Close()
+		defer close(simpleXsk.sendPktChan)
 		for {
 			select {
 			case <-simpleXsk.sendStopNoticeChan:
-				close(simpleXsk.sendPktChan)
 				return
 			case pkt, ok := <-simpleXsk.sendPktChan:
 				if !ok {
+					// 被外界关闭
 					simpleXsk.sendPktChan = nil
 					close(simpleXsk.sendStopNoticeChan)
 					simpleXsk.sendStopNoticeChan = nil
@@ -167,8 +202,6 @@ func (simpleXsk *SimpleXsk) StartSend(chanBuffSize int32, pollTimeout int) chan<
 						unix.Poll(pollFds, pollTimeout)
 						if pollFds[1].Revents&unix.POLLIN != 0 {
 							// 收到停止信号
-							close(simpleXsk.sendPktChan)
-							simpleXsk.sendPktChan = nil
 							<-simpleXsk.sendStopNoticeChan
 							return
 						}
@@ -198,8 +231,6 @@ func (simpleXsk *SimpleXsk) StartSend(chanBuffSize int32, pollTimeout int) chan<
 					unix.Poll(pollFds, pollTimeout)
 					if pollFds[1].Revents&unix.POLLIN != 0 {
 						// 收到停止信号
-						close(simpleXsk.sendPktChan)
-						simpleXsk.sendPktChan = nil
 						<-simpleXsk.sendStopNoticeChan
 						return
 					}
