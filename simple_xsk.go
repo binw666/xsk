@@ -135,6 +135,9 @@ func (simpleXsk *SimpleXsk) StartSend(chanBuffSize int32, pollTimeout int) chan<
 				return
 			case pkt, ok := <-simpleXsk.sendPktChan:
 				if !ok {
+					simpleXsk.sendPktChan = nil
+					close(simpleXsk.sendStopNoticeChan)
+					simpleXsk.sendStopNoticeChan = nil
 					return
 				}
 				for {
