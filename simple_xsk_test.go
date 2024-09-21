@@ -2,7 +2,6 @@ package xsk
 
 import (
 	"testing"
-	"time"
 )
 
 func TestNewSimpleXsk(t *testing.T) {
@@ -18,19 +17,18 @@ func TestNewSimpleXsk(t *testing.T) {
 		t.Errorf("NewSimpleXsk failed: %v", err)
 	}
 
-	recvChan := simpleXsk.StartRecv(1024, 0)
+	recvChan := simpleXsk.StartRecv(1024, -1)
 	go func() {
 		for pkt := range recvChan {
 			HexDump(pkt)
 		}
 	}()
 
-	sendChan := simpleXsk.StartSend(1024, 0)
+	sendChan := simpleXsk.StartSend(1024, -1)
 	for i := 0; i < 10000; i++ {
-		sendChan <- []byte("hello world")
+		pkt := make([]byte, 60)
+		sendChan <- pkt
 	}
-	// 测试发送和卸载是否正常，正常就提交
-	time.Sleep(5 * time.Second)
 	simpleXsk.Close()
-	time.Sleep(5 * time.Second)
+	t.Log("TestNewSimpleXsk done")
 }

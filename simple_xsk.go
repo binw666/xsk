@@ -2,6 +2,7 @@ package xsk
 
 import (
 	"container/list"
+	"os"
 	"unsafe"
 
 	"github.com/cilium/ebpf/link"
@@ -9,20 +10,24 @@ import (
 )
 
 type SimpleXsk struct {
-	umem           *XskUmem
-	xsk            *XskSocket
-	fill           XskRingProd
-	comp           XskRingCons
-	rx             XskRingCons
-	tx             XskRingProd
-	rxFreeDescList *list.List
-	txFreeDescList *list.List
-	umemArea       []byte
-	config         SimpleXskConfig
-	recvPktChan    chan []byte
-	sendPktChan    chan []byte
-	recvStopChan   chan struct{}
-	sendStopChan   chan struct{}
+	umem                 *XskUmem
+	xsk                  *XskSocket
+	fill                 XskRingProd
+	comp                 XskRingCons
+	rx                   XskRingCons
+	tx                   XskRingProd
+	rxFreeDescList       *list.List
+	txFreeDescList       *list.List
+	umemArea             []byte
+	config               SimpleXskConfig
+	recvPktChan          chan []byte
+	stopRecvReadFd       int
+	stopRecvWriteFd      int
+	stopSendReadFd       int
+	stopSendWriteFd      int
+	sendPktChan          chan []byte
+	recvStopFinishedChan chan struct{}
+	sendStopNoticeChan   chan struct{}
 }
 
 func (simpleXsk *SimpleXsk) Fd() int {
@@ -38,35 +43,50 @@ func (simpleXsk *SimpleXsk) populateFillRing() {
 	XskRingProdSubmit(&simpleXsk.fill, nb)
 }
 
-// 目前，pollTimeout 为 -1 时，存在无法关闭的风险
 func (simpleXsk *SimpleXsk) StartRecv(chanBuffSize int32, pollTimeout int) <-chan []byte {
 	if simpleXsk.recvPktChan != nil {
 		return simpleXsk.recvPktChan
 	}
 	simpleXsk.recvPktChan = make(chan []byte, chanBuffSize)
-	simpleXsk.recvStopChan = make(chan struct{})
+	simpleXsk.recvStopFinishedChan = make(chan struct{})
+
+	// 创建管道用于停止信号
+	r, w, err := os.Pipe()
+	if err != nil {
+		panic(err)
+	}
+	simpleXsk.stopRecvReadFd = int(r.Fd())
+	simpleXsk.stopRecvWriteFd = int(w.Fd())
+
 	go func() {
+		defer r.Close()
+		defer w.Close()
 		for {
-			select {
-			case <-simpleXsk.recvStopChan:
+			pos := uint32(0)
+			nPkts := XskRingConsPeek(&simpleXsk.rx, uint32(simpleXsk.config.NumFrames/2), &pos)
+			for i := uint32(0); i < nPkts; i++ {
+				desc := XskRingConsRxDesc(&simpleXsk.rx, pos+i)
+				pkt := make([]byte, desc.Len)
+				copy(pkt, simpleXsk.umemArea[desc.Addr:desc.Addr+uint64(desc.Len)])
+				simpleXsk.recvPktChan <- pkt
+				simpleXsk.rxFreeDescList.PushBack(desc.Addr)
+			}
+			XskRingConsRelease(&simpleXsk.rx, nPkts)
+			simpleXsk.populateFillRing()
+			pollFds := []unix.PollFd{{
+				Fd:     int32(simpleXsk.xsk.Fd),
+				Events: unix.POLLIN,
+			}, {
+				Fd:     int32(simpleXsk.stopRecvReadFd),
+				Events: unix.POLLIN,
+			}}
+			unix.Poll(pollFds, pollTimeout)
+			if pollFds[1].Revents&unix.POLLIN != 0 {
+				// 收到停止信号
 				close(simpleXsk.recvPktChan)
+				simpleXsk.recvPktChan = nil
+				close(simpleXsk.recvStopFinishedChan)
 				return
-			default:
-				pos := uint32(0)
-				nPkts := XskRingConsPeek(&simpleXsk.rx, uint32(simpleXsk.config.NumFrames/2), &pos)
-				for i := uint32(0); i < nPkts; i++ {
-					desc := XskRingConsRxDesc(&simpleXsk.rx, pos+i)
-					pkt := make([]byte, desc.Len)
-					copy(pkt, simpleXsk.umemArea[desc.Addr:desc.Addr+uint64(desc.Len)])
-					simpleXsk.recvPktChan <- pkt
-					simpleXsk.rxFreeDescList.PushBack(desc.Addr)
-				}
-				XskRingConsRelease(&simpleXsk.rx, nPkts)
-				simpleXsk.populateFillRing()
-				unix.Poll([]unix.PollFd{{
-					Fd:     int32(simpleXsk.xsk.Fd),
-					Events: unix.POLLIN,
-				}}, pollTimeout)
 			}
 		}
 	}()
@@ -74,10 +94,10 @@ func (simpleXsk *SimpleXsk) StartRecv(chanBuffSize int32, pollTimeout int) <-cha
 }
 
 func (simpleXsk *SimpleXsk) StopRecv() {
-	if simpleXsk.recvStopChan != nil {
-		simpleXsk.recvStopChan <- struct{}{}
-		close(simpleXsk.recvStopChan)
-		simpleXsk.recvStopChan = nil
+	if simpleXsk.recvStopFinishedChan != nil {
+		unix.Write(simpleXsk.stopRecvWriteFd, []byte{1})
+		<-simpleXsk.recvStopFinishedChan
+		simpleXsk.recvStopFinishedChan = nil
 	}
 }
 
@@ -95,12 +115,22 @@ func (simpleXsk *SimpleXsk) StartSend(chanBuffSize int32, pollTimeout int) chan<
 		return simpleXsk.sendPktChan
 	}
 	simpleXsk.sendPktChan = make(chan []byte, chanBuffSize)
-	simpleXsk.sendStopChan = make(chan struct{})
+	simpleXsk.sendStopNoticeChan = make(chan struct{})
+
+	// 创建管道用于停止信号
+	r, w, err := os.Pipe()
+	if err != nil {
+		panic(err)
+	}
+	simpleXsk.stopSendReadFd = int(r.Fd())
+	simpleXsk.stopSendWriteFd = int(w.Fd())
 
 	go func() {
+		defer r.Close()
+		defer w.Close()
 		for {
 			select {
-			case <-simpleXsk.sendStopChan:
+			case <-simpleXsk.sendStopNoticeChan:
 				close(simpleXsk.sendPktChan)
 				return
 			case pkt, ok := <-simpleXsk.sendPktChan:
@@ -124,6 +154,21 @@ func (simpleXsk *SimpleXsk) StartSend(chanBuffSize int32, pollTimeout int) chan<
 					if nb == 0 {
 						// 预留失败，回收空间并继续等待
 						simpleXsk.recycleCompRing()
+						pollFds := []unix.PollFd{{
+							Fd:     int32(simpleXsk.xsk.Fd),
+							Events: unix.POLLOUT,
+						}, {
+							Fd:     int32(simpleXsk.stopSendReadFd),
+							Events: unix.POLLIN,
+						}}
+						unix.Poll(pollFds, pollTimeout)
+						if pollFds[1].Revents&unix.POLLIN != 0 {
+							// 收到停止信号
+							close(simpleXsk.sendPktChan)
+							simpleXsk.sendPktChan = nil
+							<-simpleXsk.sendStopNoticeChan
+							return
+						}
 						continue
 					}
 					// 预留成功
@@ -140,10 +185,21 @@ func (simpleXsk *SimpleXsk) StartSend(chanBuffSize int32, pollTimeout int) chan<
 						copy(simpleXsk.umemArea[addr:addr+uint64(len(currentPkt))], currentPkt)
 					}
 					XskRingProdSubmit(&simpleXsk.tx, nb)
-					unix.Poll([]unix.PollFd{{
+					pollFds := []unix.PollFd{{
 						Fd:     int32(simpleXsk.xsk.Fd),
 						Events: unix.POLLOUT,
-					}}, pollTimeout)
+					}, {
+						Fd:     int32(simpleXsk.stopSendReadFd),
+						Events: unix.POLLIN,
+					}}
+					unix.Poll(pollFds, pollTimeout)
+					if pollFds[1].Revents&unix.POLLIN != 0 {
+						// 收到停止信号
+						close(simpleXsk.sendPktChan)
+						simpleXsk.sendPktChan = nil
+						<-simpleXsk.sendStopNoticeChan
+						return
+					}
 					break
 				}
 			}
@@ -153,10 +209,11 @@ func (simpleXsk *SimpleXsk) StartSend(chanBuffSize int32, pollTimeout int) chan<
 }
 
 func (simpleXsk *SimpleXsk) StopSend() {
-	if simpleXsk.sendStopChan != nil {
-		simpleXsk.sendStopChan <- struct{}{}
-		close(simpleXsk.sendStopChan)
-		simpleXsk.sendStopChan = nil
+	if simpleXsk.sendStopNoticeChan != nil {
+		unix.Write(simpleXsk.stopSendWriteFd, []byte{1})
+		simpleXsk.sendStopNoticeChan <- struct{}{}
+		close(simpleXsk.sendStopNoticeChan)
+		simpleXsk.sendStopNoticeChan = nil
 	}
 }
 
@@ -249,11 +306,14 @@ func NewSimpleXsk(ifaceName string, queueID uint32, config *SimpleXskConfig) (*S
 		simpleXsk.rxFreeDescList.PushBack(
 			uint64((i + uint32(simpleXsk.config.NumFrames/2)) * uint32(simpleXsk.config.FrameSize)))
 	}
-
 	simpleXsk.recvPktChan = nil
 	simpleXsk.sendPktChan = nil
-	simpleXsk.recvStopChan = nil
-	simpleXsk.sendStopChan = nil
+	simpleXsk.recvStopFinishedChan = nil
+	simpleXsk.sendStopNoticeChan = nil
+	simpleXsk.stopRecvReadFd = -1
+	simpleXsk.stopRecvWriteFd = -1
+	simpleXsk.stopSendReadFd = -1
+	simpleXsk.stopSendWriteFd = -1
 
 	return simpleXsk, nil
 
