@@ -76,48 +76,47 @@ func GetEthChannels(ifName string) (*EthtoolChannels, error) {
 	return &channels, nil
 }
 
-// HexDump 打印给定字节切片的十六进制转储到标准输出。
-// 输出的每一行包含16个字节的十六进制表示，后跟这些字节的ASCII表示。
-// 不可打印的ASCII字符在ASCII输出中用点（'.'）表示。
+// HexDump 返回一个字符串，该字符串表示给定字节切片的十六进制视图。
+// 输出的每一行包含 16 个字节的十六进制表示，后跟它们的 ASCII 表示。
+// 不可打印的 ASCII 字符用点 ('.') 表示。
 //
 // 参数:
-//   - data: 要转储的字节切片。
+//   - data: 要转换为十六进制转储的字节切片。
 //
-// 示例:
+// 返回值:
 //
-//	data := []byte("Hello, World!")
-//	HexDump(data)
-//
-// 输出:
-//
-//	48 65 6C 6C 6F 2C 20 57 6F 72 6C 64 21       | Hello, World!
-func HexDump(data []byte) {
+//	包含输入字节切片的十六进制转储的字符串。
+func HexDump(data []byte) string {
 	const bytesPerLine = 16
+	var result string
+
 	for i := 0; i < len(data); i += bytesPerLine {
 		end := i + bytesPerLine
 		if end > len(data) {
 			end = len(data)
 		}
 
-		// Print hex bytes
+		// Append hex bytes
 		for j := i; j < end; j++ {
-			fmt.Printf("%02X ", data[j])
+			result += fmt.Sprintf("%02X ", data[j])
 		}
 
 		// Pad remaining space if line is less than 16 bytes
 		for j := end; j < i+bytesPerLine; j++ {
-			fmt.Print("   ")
+			result += "   "
 		}
 
-		// Print ASCII characters
-		fmt.Print(" | ")
+		// Append ASCII characters
+		result += " | "
 		for j := i; j < end; j++ {
 			if unicode.IsPrint(rune(data[j])) {
-				fmt.Printf("%c", data[j])
+				result += fmt.Sprintf("%c", data[j])
 			} else {
-				fmt.Print(".")
+				result += "."
 			}
 		}
-		fmt.Println()
+		result += "\n"
 	}
+
+	return result
 }

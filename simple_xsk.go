@@ -2,6 +2,7 @@ package xsk
 
 import (
 	"container/list"
+	"errors"
 	"os"
 	"unsafe"
 
@@ -20,15 +21,23 @@ type SimpleXsk struct {
 	txFreeDescList       *list.List
 	umemArea             []byte
 	config               SimpleXskConfig
-	recvPktChan          chan []byte
-	sendPktChan          chan []byte
+	recvPktChan          chan Packet
+	sendPktChan          chan Packet
 	stopRecvReadFd       int
 	stopRecvWriteFd      int
 	stopSendReadFd       int
 	stopSendWriteFd      int
 	recvStopFinishedChan chan struct{}
 	sendStopNoticeChan   chan struct{}
+	recvHandler          func([]byte)
 }
+
+// 多次 StartRecv 的错误
+var ErrAnotherRecvRunning = errors.New("another recv goroutine is running")
+var ErrAnotherRecvChanRunning = errors.New("another recv chan goroutine is running, params will not work")
+
+// 多次 StartSend 的错误，参数不会生效
+var ErrAnotherSendChanRunning = errors.New("another send chan goroutine is running, params will not work")
 
 func (simpleXsk *SimpleXsk) Fd() int {
 	return simpleXsk.xsk.Fd
@@ -43,32 +52,11 @@ func (simpleXsk *SimpleXsk) populateFillRing() {
 	XskRingProdSubmit(&simpleXsk.fill, nb)
 }
 
-// StartRecv 初始化并启动一个 goroutine 从 XSK (eXpress Data Path Socket) 接收数据包。
-// 它返回一个 chan ,通过该 chan 发送接收到的数据包。
-// 注意：不要关闭返回的 chan，如想停止接收数据包，请调用 StopRecv 函数！！！
-//
-// 参数:
-// - chanBuffSize: 用于发送接收到的数据包的通道的缓冲区大小。
-// - pollTimeout: 用于等待数据包接收或停止信号的 poll 系统调用的超时值（以毫秒为单位），-1 表示阻塞。
-//
-// 返回值:
-// - 一个只接收字节切片（[]byte）的通道，每个切片代表一个接收到的数据包。
-//
-// 该函数执行以下步骤:
-// 1. 检查接收数据包通道 (recvPktChan) 是否已初始化。如果是，则返回现有通道。
-// 2. 初始化接收数据包通道 (recvPktChan) 和一个用于信号接收停止过程完成的通道 (recvStopFinishedChan)。
-// 3. 创建一个管道来处理停止信号。
-// 4. 启动一个 goroutine：
-//   - 不断从 XSK 环形缓冲区接收数据包。
-//   - 将接收到的数据包复制到字节切片中，并通过 recvPktChan 通道发送它们。
-//   - 将描述符释放回 XSK 环形缓冲区并重新填充填充环。
-//   - 使用 poll 系统调用等待数据包接收或停止信号。
-//   - 收到停止信号时退出循环并关闭通道。
-func (simpleXsk *SimpleXsk) StartRecv(chanBuffSize int32, pollTimeout int) <-chan []byte {
-	if simpleXsk.recvPktChan != nil {
-		return simpleXsk.recvPktChan
+func (simpleXsk *SimpleXsk) StartRecv(chanBuffSize int32, pollTimeout int, recvHandler func([]byte)) error {
+	if simpleXsk.recvHandler != nil {
+		return ErrAnotherRecvRunning
 	}
-	simpleXsk.recvPktChan = make(chan []byte, chanBuffSize)
+	simpleXsk.recvHandler = recvHandler
 	simpleXsk.recvStopFinishedChan = make(chan struct{})
 
 	// 创建管道用于停止信号
@@ -83,15 +71,12 @@ func (simpleXsk *SimpleXsk) StartRecv(chanBuffSize int32, pollTimeout int) <-cha
 		defer r.Close()
 		defer w.Close()
 		defer close(simpleXsk.recvStopFinishedChan)
-		defer close(simpleXsk.recvPktChan)
 		for {
 			pos := uint32(0)
 			nPkts := XskRingConsPeek(&simpleXsk.rx, uint32(simpleXsk.config.NumFrames/2), &pos)
 			for i := uint32(0); i < nPkts; i++ {
 				desc := XskRingConsRxDesc(&simpleXsk.rx, pos+i)
-				pkt := make([]byte, desc.Len)
-				copy(pkt, simpleXsk.umemArea[desc.Addr:desc.Addr+uint64(desc.Len)])
-				simpleXsk.recvPktChan <- pkt
+				recvHandler(simpleXsk.umemArea[desc.Addr : desc.Addr+uint64(desc.Len)])
 				simpleXsk.rxFreeDescList.PushBack(desc.Addr)
 			}
 			XskRingConsRelease(&simpleXsk.rx, nPkts)
@@ -110,15 +95,58 @@ func (simpleXsk *SimpleXsk) StartRecv(chanBuffSize int32, pollTimeout int) <-cha
 			}
 		}
 	}()
-	return simpleXsk.recvPktChan
+	return nil
 }
 
+// StartRecvChan 初始化并启动一个接收数据包的通道，具有指定的缓冲区大小和轮询超时。
+// 它还允许使用一个可选的过滤函数来处理传入的数据包。
+//
+// 参数:
+//   - chanBuffSize: 接收通道的缓冲区大小。
+//   - pollTimeout: 轮询操作的超时时间。
+//   - filter: 用于过滤传入数据包的函数。如果为 nil，则接受所有数据包。
+//
+// 返回值:
+//   - (<-chan Packet): 一个只读通道，通过该通道接收数据包。
+//   - (error): 如果另一个接收通道已经在运行或启动接收器时出现问题，则返回错误。
+//
+// 如果一个接收通道已经在运行，它将返回现有的通道，并返回一个错误，指示另一个接收通道已经在运行。
+// 如果过滤函数为 nil，则使用一个接受所有数据包的默认过滤器。
+func (simpleXsk *SimpleXsk) StartRecvChan(chanBuffSize int32, pollTimeout int, filter func([]byte) bool) (<-chan Packet, error) {
+	if simpleXsk.recvPktChan != nil {
+		return simpleXsk.recvPktChan, ErrAnotherRecvChanRunning
+	}
+	if filter == nil {
+		filter = func([]byte) bool { return true }
+	}
+	simpleXsk.recvPktChan = make(chan Packet, chanBuffSize)
+	recvHandler := func(desc []byte) {
+		if !filter(desc) {
+			return
+		}
+		pkt := new(SimplePacket)
+		pkt.SetData(desc)
+		simpleXsk.recvPktChan <- pkt
+	}
+	err := simpleXsk.StartRecv(chanBuffSize, pollTimeout, recvHandler)
+	if err != nil {
+		close(simpleXsk.recvPktChan)
+		return nil, err
+	}
+	return simpleXsk.recvPktChan, nil
+}
+
+// StopRecv 停止接收数据包，用来关闭 StartRecvChan 或 StartRecv 。
 func (simpleXsk *SimpleXsk) StopRecv() {
-	if simpleXsk.recvStopFinishedChan != nil {
+	if simpleXsk.recvHandler != nil {
 		unix.Write(simpleXsk.stopRecvWriteFd, []byte{1})
 		<-simpleXsk.recvStopFinishedChan
 		simpleXsk.recvStopFinishedChan = nil
-		simpleXsk.recvPktChan = nil
+		simpleXsk.recvHandler = nil
+		if simpleXsk.recvPktChan != nil {
+			close(simpleXsk.recvPktChan)
+			simpleXsk.recvPktChan = nil
+		}
 	}
 }
 
@@ -131,24 +159,26 @@ func (simpleXsk *SimpleXsk) recycleCompRing() {
 	XskRingConsRelease(&simpleXsk.comp, nPkts)
 }
 
-// StartSend 初始化并启动一个 goroutine 用于通过 SimpleXsk 实例发送数据包。
-// 它创建用于数据包发送和停止通知的通道，设置用于信号的文件描述符，并使用 XDP 套接字 (Xsk) 环管理数据包的传输。
-// 注意：不要关闭返回的 chan，如想停止发送数据包，请调用 StopSend 函数！！！
+// StartSendChan 初始化并启动一个发送数据包的通道。
+// 它创建一个用于数据包的缓冲通道和一个停止通知通道。
+// 它还设置了一个用于处理停止信号的管道，并启动一个 goroutine 来处理发送通道中的数据包。
 //
 // 参数:
-// - chanBuffSize: 发送数据包通道的缓冲区大小。
-// - pollTimeout: 轮询文件描述符的超时值。
+// - chanBuffSize: 数据包缓冲通道的大小。
+// - pollTimeout: 轮询操作的超时时间。
+// - postProcess: 一个用于后处理每个数据包的函数。
 //
 // 返回值:
-// - 一个发送数据包通道 (chan<- []byte)，通过该通道可以发送数据包。
+// - chan<- Packet: 一个用于发送数据包的发送通道。
+// - error: 如果另一个发送通道已经在运行，则返回错误。
 //
-// 该函数确保发送数据包通道只创建一次。它还处理完成环的回收、预留和提交传输描述符，以及轮询发送或停止信号的准备情况。
-// goroutine 在收到停止信号或发送数据包通道被外部关闭时退出。
-func (simpleXsk *SimpleXsk) StartSend(chanBuffSize int32, pollTimeout int) chan<- []byte {
+// 如果一个发送通道已经在运行，它将返回现有的通道，并返回一个错误，指示另一个发送通道已经在运行。
+// 如果发送通道被外部关闭，goroutine 将清理资源并退出。
+func (simpleXsk *SimpleXsk) StartSendChan(chanBuffSize int32, pollTimeout int, postProcess func(Packet)) (chan<- Packet, error) {
 	if simpleXsk.sendPktChan != nil {
-		return simpleXsk.sendPktChan
+		return simpleXsk.sendPktChan, ErrAnotherSendChanRunning
 	}
-	simpleXsk.sendPktChan = make(chan []byte, chanBuffSize)
+	simpleXsk.sendPktChan = make(chan Packet, chanBuffSize)
 	simpleXsk.sendStopNoticeChan = make(chan struct{})
 
 	// 创建管道用于停止信号
@@ -209,7 +239,7 @@ func (simpleXsk *SimpleXsk) StartSend(chanBuffSize int32, pollTimeout int) chan<
 					}
 					// 预留成功
 					for i := uint32(0); i < nb; i++ {
-						var currentPkt []byte
+						var currentPkt Packet
 						if i == 0 {
 							currentPkt = pkt
 						} else {
@@ -217,8 +247,11 @@ func (simpleXsk *SimpleXsk) StartSend(chanBuffSize int32, pollTimeout int) chan<
 						}
 						addr := simpleXsk.txFreeDescList.Remove(simpleXsk.txFreeDescList.Front()).(uint64)
 						XskRingProdTxDesc(&simpleXsk.tx, pos+i).Addr = addr
-						XskRingProdTxDesc(&simpleXsk.tx, pos+i).Len = uint32(len(currentPkt))
-						copy(simpleXsk.umemArea[addr:addr+uint64(len(currentPkt))], currentPkt)
+						XskRingProdTxDesc(&simpleXsk.tx, pos+i).Len = uint32(currentPkt.Len())
+						copy(simpleXsk.umemArea[addr:addr+uint64(currentPkt.Len())], currentPkt.Data())
+						if postProcess != nil {
+							postProcess(currentPkt)
+						}
 					}
 					XskRingProdSubmit(&simpleXsk.tx, nb)
 					pollFds := []unix.PollFd{{
@@ -239,10 +272,10 @@ func (simpleXsk *SimpleXsk) StartSend(chanBuffSize int32, pollTimeout int) chan<
 			}
 		}
 	}()
-	return simpleXsk.sendPktChan
+	return simpleXsk.sendPktChan, nil
 }
 
-func (simpleXsk *SimpleXsk) StopSend() {
+func (simpleXsk *SimpleXsk) StopSendChan() {
 	if simpleXsk.sendStopNoticeChan != nil {
 		unix.Write(simpleXsk.stopSendWriteFd, []byte{1})
 		simpleXsk.sendStopNoticeChan <- struct{}{}
@@ -253,7 +286,7 @@ func (simpleXsk *SimpleXsk) StopSend() {
 
 func (simpleXsk *SimpleXsk) Close() {
 	simpleXsk.StopRecv()
-	simpleXsk.StopSend()
+	simpleXsk.StopSendChan()
 	if simpleXsk.xsk != nil {
 		XskSocketDelete(simpleXsk.xsk)
 		simpleXsk.xsk = nil
