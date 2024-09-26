@@ -1,0 +1,35 @@
+total_size: 100  # 数据包总大小（字节）
+
+ethernet:
+  src_mac:
+    - "00:0C:29:3E:1A:2B"
+    - "00:1A:2B:3C:4D:5E"
+  dst_mac:
+    - "FF:FF:FF:FF:FF:FF"
+    - "00:1A:2B:3C:4D:5F"
+
+ip:
+  ttl:
+    - "64"
+    - "128-255"
+  src_ip:
+    - "192.168.1.100-192.168.1.200"
+    - "10.0.0.1"
+  dst_ip:
+    - "192.168.1.1-192.168.1.255"
+    - "10.0.0.2"
+
+transport:
+  protocol: "ICMP"  # 支持 "TCP", "UDP", "ICMP"
+
+  # 对于 ICMP
+  icmp_types:
+    - type: 8
+      code: 0  # Echo Request
+    - type: 0
+      code: 0  # Echo Reply
+    - type: 3
+      code: 1  # Destination Unreachable: Host Unreachable
+
+payload:
+  random: true  # 生成随机负载数据

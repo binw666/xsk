@@ -4,89 +4,89 @@ import (
 	"flag"
 	"log"
 	"os"
-	"os/signal"
 	"sync/atomic"
 	"time"
 
 	"github.com/binw666/xsk"
+	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
+	"gopkg.in/yaml.v3"
 )
 
 func main() {
 	iface := flag.String("i", "ens2", "interface name")
-	pktSize := flag.Int("s", 64, "packet size")
+	configPath := flag.String("c", "udp.yaml", "config file path")
 	queueNum := flag.Int("q", 1, "queue quantity")
-	rate := flag.Int("r", -1, "packet rate")
 	flag.Parse()
-
-	if *queueNum < 1 {
-		log.Fatalf("queue quantity must be greater than 0.")
-	}
-
-	NumFrames := 4096
-	FrameSize := 2048
-	sendNum := uint64(0)
-
-	ethChannels, err := xsk.GetEthChannels(*iface)
+	// 读取配置文件
+	configData, err := os.ReadFile(*configPath)
 	if err != nil {
-		log.Fatalf("GetEthChannels failed: %v", err)
+		log.Fatalf("Error reading config.yaml: %v", err)
 	}
-	maxQueueNum := int(ethChannels.TXCount)
-	if maxQueueNum == 0 {
-		maxQueueNum = int(ethChannels.CombinedCount)
+
+	// 解析配置文件
+	var config Config
+	err = yaml.Unmarshal(configData, &config)
+	if err != nil {
+		log.Fatalf("Error parsing config.yaml: %v", err)
 	}
-	if maxQueueNum < *queueNum {
-		log.Fatalf("queue quantity must be less than or equal to %d.", maxQueueNum)
-	}
-	simXsks := make([]*xsk.SimpleXsk, 0, maxQueueNum)
-	for queueID := 0; queueID < *queueNum; queueID++ {
-		simXsk, err := xsk.NewSimpleXsk(*iface, uint32(queueID), &xsk.SimpleXskConfig{
-			NumFrames:   NumFrames,
-			FrameSize:   FrameSize,
-			LibbpfFlags: xsk.XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
+	sendCount := uint64(0)
+
+	for i := 0; i < *queueNum; i++ {
+		complexXsk, descs, err := xsk.NewComplexXsk(*iface, uint32(i), &xsk.ComplexXskConfig{
+			UmemConfig: &xsk.ComplexUmemConfig{
+				FillSize:      2048,
+				CompSize:      2048,
+				FrameNum:      4096,
+				FrameSize:     2048,
+				FrameHeadroom: 0,
+				Flags:         0,
+			},
+			SocketConfig: &xsk.ComplexSocketConfig{
+				RxSize:      2048,
+				TxSize:      2048,
+				LibbpfFlags: xsk.XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
+				XdpFlags:    link.XDPGenericMode,
+				BindFlags:   unix.XDP_USE_NEED_WAKEUP,
+			},
 		})
 		if err != nil {
-			log.Fatalf("NewSimpleXsk failed: %v", err)
+			log.Fatalf("NewComplexXsk failed: %v", err)
 		}
-		simXsks = append(simXsks, simXsk)
-		sendChan := simXsk.StartSend(1<<12, -1)
+		defer complexXsk.Close()
+		txDesc := make([]xsk.XDPDesc, 2048)
+		for i := 0; i < 2048; i++ {
+			txDesc[i] = descs[i]
+		}
+		rxDesc := make([]xsk.XDPDesc, 2048)
+		for i := 0; i < 2048; i++ {
+			rxDesc[i] = descs[i+2048]
+		}
+		for i := 0; i < 2048; i++ {
+			packet, err := GenerateEthernetPacket(config)
+			if err != nil {
+				log.Fatalf("Error generating Ethernet packet: %v", err)
+			}
+			txDesc[i].Len = uint32(config.TotalSize)
+			copy(complexXsk.UmemArea(txDesc[i]), packet)
+		}
+		complexXsk.PopulateTxRing(txDesc)
 		go func() {
-			pkt := make([]byte, *pktSize)
-			if *rate > 0 {
-				for {
-					if pktNum := atomic.LoadUint64(&sendNum); pktNum >= uint64(*rate) {
-						continue
-					}
-					sendChan <- pkt
-					atomic.AddUint64(&sendNum, 1)
+			for {
+				complexXsk.Poll(unix.POLLOUT, -1)
+				recyDescs := complexXsk.RecycleCompRing()
+				atomic.AddUint64(&sendCount, uint64(len(recyDescs)))
+				for i := 0; i < len(recyDescs); i++ {
+					recyDescs[i].Len = uint32(config.TotalSize)
 				}
-			} else {
-				for {
-					sendChan <- pkt
-					atomic.AddUint64(&sendNum, 1)
-				}
+				complexXsk.PopulateTxRing(recyDescs)
 			}
 		}()
 	}
-	// 捕获终止信号
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, unix.SIGINT, unix.SIGTERM)
 
-	go func() {
-		for {
-			pktNum := atomic.SwapUint64(&sendNum, 0)
-			pktBytes := pktNum * uint64(*pktSize) * 8
-			log.Printf("%d pps %d bps %d mbps", pktNum, pktBytes, pktBytes>>20)
-			time.Sleep(time.Second)
-		}
-	}()
-
-	// 等待信号
-	<-sigs
-	log.Println("Received termination signal, cleaning up...")
-	for _, simXsk := range simXsks {
-		simXsk.Close() // 确保所有的 simXsk 都被关闭
+	for {
+		time.Sleep(1 * time.Second)
+		sendCount := atomic.SwapUint64(&sendCount, 0)
+		log.Printf("Send %d packets, %d bytes\n", sendCount, sendCount*uint64(config.TotalSize))
 	}
-	log.Println("Resources cleaned up, exiting.")
-
 }
