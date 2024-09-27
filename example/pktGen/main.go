@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
+	"encoding/binary"
 	"flag"
 	"log"
 	"os"
+	"os/signal"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -13,10 +17,16 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+func int64ToBytes(i int64) []byte {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], uint64(i))
+	return buf[:]
+}
 func main() {
 	iface := flag.String("i", "ens2", "interface name")
 	configPath := flag.String("c", "udp.yaml", "config file path")
 	queueNum := flag.Int("q", 1, "queue quantity")
+	rate := flag.Int64("r", -1, "packet rate")
 	flag.Parse()
 	// 读取配置文件
 	configData, err := os.ReadFile(*configPath)
@@ -30,8 +40,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error parsing config.yaml: %v", err)
 	}
+	headerSize := GetAllHeaderLength(config)
+	pktHandler := func(bytes []byte) {}
+	if config.Payload.TimeStamp {
+		pktHandler = func(bytes []byte) {
+			timeStamp := time.Now().UnixNano()
+			copy(bytes[headerSize:], int64ToBytes(timeStamp))
+		}
+	}
 	sendCount := uint64(0)
-
+	totalCount := uint64(0)
+	wg := sync.WaitGroup{}
+	ctx, cancel := context.WithCancel(context.Background())
 	for i := 0; i < *queueNum; i++ {
 		complexXsk, descs, err := xsk.NewComplexXsk(*iface, uint32(i), &xsk.ComplexXskConfig{
 			UmemConfig: &xsk.ComplexUmemConfig{
@@ -53,7 +73,6 @@ func main() {
 		if err != nil {
 			log.Fatalf("NewComplexXsk failed: %v", err)
 		}
-		defer complexXsk.Close()
 		txDesc := make([]xsk.XDPDesc, 2048)
 		for i := 0; i < 2048; i++ {
 			txDesc[i] = descs[i]
@@ -71,22 +90,46 @@ func main() {
 			copy(complexXsk.UmemArea(txDesc[i]), packet)
 		}
 		complexXsk.PopulateTxRing(txDesc)
+		wg.Add(1)
+
 		go func() {
+			defer wg.Done()
 			for {
-				complexXsk.Poll(unix.POLLOUT, -1)
-				recyDescs := complexXsk.RecycleCompRing()
-				atomic.AddUint64(&sendCount, uint64(len(recyDescs)))
-				for i := 0; i < len(recyDescs); i++ {
-					recyDescs[i].Len = uint32(config.TotalSize)
+				select {
+				case <-ctx.Done():
+					complexXsk.Close()
+					return
+				default:
+					for *rate > int64(0) && atomic.LoadUint64(&sendCount) >= uint64(*rate) {
+						time.Sleep(1 * time.Millisecond)
+					}
+					complexXsk.Poll(unix.POLLOUT, 0)
+					recyDescs := complexXsk.RecycleCompRing()
+					atomic.AddUint64(&sendCount, uint64(len(recyDescs)))
+					for i := 0; i < len(recyDescs); i++ {
+						pktHandler(complexXsk.UmemArea(recyDescs[i]))
+						recyDescs[i].Len = uint32(config.TotalSize)
+					}
+					complexXsk.PopulateTxRing(recyDescs)
 				}
-				complexXsk.PopulateTxRing(recyDescs)
 			}
 		}()
 	}
 
-	for {
-		time.Sleep(1 * time.Second)
-		sendCount := atomic.SwapUint64(&sendCount, 0)
-		log.Printf("Send %d packets, %d bytes\n", sendCount, sendCount*uint64(config.TotalSize))
-	}
+	go func() {
+		for {
+			time.Sleep(1 * time.Second)
+			sendCount := atomic.SwapUint64(&sendCount, 0)
+			totalCount += sendCount
+			log.Printf("Send rate: %d pps, %d Bps, %d Mbps\n", sendCount, sendCount*uint64(config.TotalSize), sendCount*uint64(config.TotalSize)>>17)
+		}
+	}()
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, unix.SIGINT, unix.SIGTERM)
+	<-sigs
+	log.Println("Received termination signal, cleaning up...")
+	cancel()
+	wg.Wait()
+	log.Printf("Sent %d packets, %d bytes\n", totalCount, totalCount*uint64(config.TotalSize))
 }
