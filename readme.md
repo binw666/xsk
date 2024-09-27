@@ -21,9 +21,14 @@ cd xdp-tools
 ./configure
 make
 make install
-
+# 需要挂载bpf文件系统
+mount -t bpf none /sys/fs/bpf
 ```
 
 # 示例
 
-参考 `example` 文件夹中的 `pktgen` 和 `pktRecv`
+参考 `example` 文件夹中的 `pktGen` 和 `pktRecv`
+
+# 已知问题
+
+- rx 通道 bug：在填充 FillRing 后，从 RxRing 回收的 Desc 的 addr 会变成 addr + 256 , 将 addr + 256 填充后，回收则不会变化，可能是内存对齐的问题？或者程序bug？
