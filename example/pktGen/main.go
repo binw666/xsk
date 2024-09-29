@@ -22,11 +22,17 @@ func int64ToBytes(i int64) []byte {
 	binary.LittleEndian.PutUint64(buf[:], uint64(i))
 	return buf[:]
 }
+
+func getMonotonicTime() int64 {
+	var ts unix.Timespec
+	unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
+	return ts.Nano()
+}
 func main() {
-	iface := flag.String("i", "ens2", "interface name")
+	iface := flag.String("i", "ens1f1", "interface name")
 	configPath := flag.String("c", "udp.yaml", "config file path")
-	queueNum := flag.Int("q", 1, "queue quantity")
-	rate := flag.Int64("r", -1, "packet rate")
+	queueNum := flag.Int("q", 30, "queue quantity")
+	rate := flag.Int64("r", 1000, "packet rate")
 	flag.Parse()
 	// 读取配置文件
 	configData, err := os.ReadFile(*configPath)
@@ -41,13 +47,6 @@ func main() {
 		log.Fatalf("Error parsing config.yaml: %v", err)
 	}
 	headerSize := GetAllHeaderLength(config)
-	pktHandler := func(bytes []byte) {}
-	if config.Payload.TimeStamp {
-		pktHandler = func(bytes []byte) {
-			timeStamp := time.Now().UnixNano()
-			copy(bytes[headerSize:], int64ToBytes(timeStamp))
-		}
-	}
 	sendCount := uint64(0)
 	totalCount := uint64(0)
 	wg := sync.WaitGroup{}
@@ -81,12 +80,17 @@ func main() {
 		for i := 0; i < 2048; i++ {
 			rxDesc[i] = descs[i+2048]
 		}
+		timeStamp := getMonotonicTime()
+		timeStampBytes := int64ToBytes(timeStamp)
 		for i := 0; i < 2048; i++ {
 			packet, err := GenerateEthernetPacket(config)
 			if err != nil {
 				log.Fatalf("Error generating Ethernet packet: %v", err)
 			}
 			txDesc[i].Len = uint32(config.TotalSize)
+			if config.Payload.TimeStamp {
+				copy(packet[headerSize:], timeStampBytes)
+			}
 			copy(complexXsk.UmemArea(txDesc[i]), packet)
 		}
 		complexXsk.PopulateTxRing(txDesc)
@@ -106,9 +110,17 @@ func main() {
 					complexXsk.Poll(unix.POLLOUT, 0)
 					recyDescs := complexXsk.RecycleCompRing()
 					atomic.AddUint64(&sendCount, uint64(len(recyDescs)))
-					for i := 0; i < len(recyDescs); i++ {
-						pktHandler(complexXsk.UmemArea(recyDescs[i]))
-						recyDescs[i].Len = uint32(config.TotalSize)
+					if config.Payload.TimeStamp {
+						timeStamp := getMonotonicTime()
+						timeStampBytes := int64ToBytes(timeStamp)
+						for i := 0; i < len(recyDescs); i++ {
+							copy(complexXsk.UmemArea(recyDescs[i])[headerSize:], timeStampBytes)
+							recyDescs[i].Len = uint32(config.TotalSize)
+						}
+					} else {
+						for i := 0; i < len(recyDescs); i++ {
+							recyDescs[i].Len = uint32(config.TotalSize)
+						}
 					}
 					complexXsk.PopulateTxRing(recyDescs)
 				}

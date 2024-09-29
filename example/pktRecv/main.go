@@ -17,6 +17,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func getMonotonicTime() int64 {
+	var ts unix.Timespec
+	unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
+	return ts.Nano()
+}
+
 func GetAllHeaderLength(mode string) int {
 	const (
 		ethHeaderLen  = 14
@@ -37,35 +43,14 @@ func GetAllHeaderLength(mode string) int {
 	}
 }
 func main() {
-	iface := flag.String("i", "ens2", "interface name")
-	queueNum := flag.Int("q", 1, "queue quantity")
+	iface := flag.String("i", "ens1f0", "interface name")
+	queueNum := flag.Int("q", 30, "queue quantity")
 	mode := flag.String("m", "udp", "mode(udp, tcp, icmp)")
-	timeStampEnable := flag.Bool("t", false, "enable timestamp")
+	timeStampEnable := flag.Bool("t", true, "enable timestamp")
 	flag.Parse()
 	// 分布数组
 	dist := make([]uint64, 100000)
 	pktSize := GetAllHeaderLength(*mode)
-	pktHandler := func(bytes []byte) {
-		// dist[0] 原子加
-		atomic.AddUint64(&dist[0], 1)
-	}
-	if *timeStampEnable {
-		pktHandler = func(bytes []byte) {
-			// 加载时间戳
-			timeStamp := bytes[pktSize : pktSize+8]
-			// 对比当前时间，计算差值
-			now := time.Now().UnixNano()
-			diff := now - int64(binary.LittleEndian.Uint64(timeStamp))
-			// 换算毫秒单位
-			diffMs := diff / 1000000
-			if diffMs < 0 {
-				diffMs = 0
-			} else if diffMs > 99999 {
-				diffMs = 99999
-			}
-			atomic.AddUint64(&dist[diffMs], 1)
-		}
-	}
 	recvCount := uint64(0)
 	recvBytes := uint64(0)
 	totalCount := uint64(0)
@@ -115,9 +100,30 @@ func main() {
 					complexXsk.Poll(unix.POLLIN, 0)
 					recyDescs := complexXsk.RecycleRxRing()
 					atomic.AddUint64(&recvCount, uint64(len(recyDescs)))
-					for i := 0; i < len(recyDescs); i++ {
-						atomic.AddUint64(&recvBytes, uint64(recyDescs[i].Len))
-						pktHandler(complexXsk.UmemArea(recyDescs[i]))
+					if *timeStampEnable {
+						now := getMonotonicTime()
+						for i := 0; i < len(recyDescs); i++ {
+							atomic.AddUint64(&recvBytes, uint64(recyDescs[i].Len))
+							pkt := complexXsk.UmemArea(recyDescs[i])
+							// 加载时间戳
+							timeStamp := pkt[pktSize : pktSize+8]
+							// 对比当前时间，计算差值
+							sendTime := int64(binary.LittleEndian.Uint64(timeStamp))
+							diff := now - sendTime
+							// 换算毫秒单位
+							diffMs := diff / 1000000
+							if diffMs < 0 {
+								diffMs = 0
+							} else if diffMs > 99999 {
+								diffMs = 99999
+							}
+							atomic.AddUint64(&dist[diffMs], 1)
+						}
+
+					} else {
+						for i := 0; i < len(recyDescs); i++ {
+							atomic.AddUint64(&recvBytes, uint64(recyDescs[i].Len))
+						}
 					}
 					complexXsk.PopulateFillRing(recyDescs)
 				}
