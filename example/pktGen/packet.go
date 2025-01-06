@@ -57,8 +57,12 @@ type Range struct {
 	Max int
 }
 
-// parseRangeString parses a string which can be a single number or a range "min-max"
 func parseRangeString(s string) (Range, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return Range{}, fmt.Errorf("empty range string")
+	}
+
 	if strings.Contains(s, "-") {
 		parts := strings.Split(s, "-")
 		if len(parts) != 2 {
@@ -77,8 +81,8 @@ func parseRangeString(s string) (Range, error) {
 		}
 		return Range{Min: min, Max: max}, nil
 	}
-	// Single value
-	val, err := strconv.Atoi(strings.TrimSpace(s))
+
+	val, err := strconv.Atoi(s)
 	if err != nil {
 		return Range{}, fmt.Errorf("invalid value: %s", s)
 	}
@@ -124,16 +128,22 @@ func parseIPList(ipList []string) ([][2]net.IP, error) {
 	return parsedIPs, nil
 }
 
-// randomIP 在给定的 IP 范围内随机生成一个 IP
 func randomIP(ipRanges [][2]net.IP) net.IP {
+	if len(ipRanges) == 0 {
+		return net.IPv4(127, 0, 0, 1) // Return localhost if no ranges provided
+	}
+
 	selectedRange := ipRanges[rand.Intn(len(ipRanges))]
 	minIP := selectedRange[0].To4()
 	maxIP := selectedRange[1].To4()
+
+	if minIP == nil || maxIP == nil {
+		return net.IPv4(127, 0, 0, 1) // Return localhost if invalid IP
+	}
+
 	ip := make(net.IP, 4)
 	for i := 0; i < 4; i++ {
-		if minIP[i] > maxIP[i] {
-			ip[i] = minIP[i]
-		} else if minIP[i] == maxIP[i] {
+		if minIP[i] == maxIP[i] {
 			ip[i] = minIP[i]
 		} else {
 			ip[i] = byte(rand.Intn(int(maxIP[i]-minIP[i])+1) + int(minIP[i]))
@@ -203,7 +213,7 @@ func randomICMPTypeCode(icmpTypes []ICMPTypeCode) (layers.ICMPv4TypeCode, error)
 	return layers.CreateICMPv4TypeCode(uint8(selected.Type), uint8(selected.Code)), nil
 }
 
-func GetAllHeaderLength(config Config) int {
+func GetAllHeaderLength(config Config) (int, error) {
 	const (
 		ethHeaderLen  = 14
 		ipHeaderLen   = 20
@@ -211,126 +221,148 @@ func GetAllHeaderLength(config Config) int {
 		udpHeaderLen  = 8
 		icmpHeaderLen = 8
 	)
-	switch strings.ToUpper(config.Transport.Protocol) {
+
+	protocol := strings.ToUpper(config.Transport.Protocol)
+	switch protocol {
 	case "TCP":
-		return ethHeaderLen + ipHeaderLen + tcpHeaderLen
+		return ethHeaderLen + ipHeaderLen + tcpHeaderLen, nil
 	case "UDP":
-		return ethHeaderLen + ipHeaderLen + udpHeaderLen
+		return ethHeaderLen + ipHeaderLen + udpHeaderLen, nil
 	case "ICMP":
-		return ethHeaderLen + ipHeaderLen + icmpHeaderLen
+		return ethHeaderLen + ipHeaderLen + icmpHeaderLen, nil
 	default:
-		return 0
+		return 0, fmt.Errorf("unsupported protocol: %s", protocol)
 	}
 }
 
-// GenerateEthernetPacket 根据配置生成以太网数据包
 func GenerateEthernetPacket(config Config) ([]byte, error) {
-	const (
-		ethHeaderLen  = 14
-		ipHeaderLen   = 20
-		tcpHeaderLen  = 20
-		udpHeaderLen  = 8
-		icmpHeaderLen = 8
-	)
-
-	// Determine transport header length based on protocol
-	var transportHeaderLen int
-	switch strings.ToUpper(config.Transport.Protocol) {
-	case "TCP":
-		transportHeaderLen = tcpHeaderLen
-	case "UDP":
-		transportHeaderLen = udpHeaderLen
-	case "ICMP":
-		transportHeaderLen = icmpHeaderLen
-	default:
-		return nil, fmt.Errorf("unsupported protocol: %s", config.Transport.Protocol)
-	}
-
-	// Calculate payload length
-	payloadLen := config.TotalSize - ethHeaderLen - ipHeaderLen - transportHeaderLen
-	if payloadLen < 0 {
-		return nil, fmt.Errorf("total size %d is too small for protocol %s", config.TotalSize, config.Transport.Protocol)
-	}
-
-	// Parse Ethernet MAC addresses
-	srcMACs, err := parseMACList(config.Ethernet.SrcMAC)
+	// Validate minimum packet size
+	headerLen, err := GetAllHeaderLength(config)
 	if err != nil {
 		return nil, err
 	}
-	if len(srcMACs) == 0 {
-		// 使用默认源 MAC 地址
-		srcMACs = append(srcMACs, net.HardwareAddr{0x00, 0x0C, 0x29, 0x3E, 0x1A, 0x2B})
+
+	if config.TotalSize < headerLen {
+		return nil, fmt.Errorf("total size %d is too small (minimum required: %d)",
+			config.TotalSize, headerLen)
+	}
+
+	// Validate protocol
+	protocol := strings.ToUpper(config.Transport.Protocol)
+	if protocol != "TCP" && protocol != "UDP" && protocol != "ICMP" {
+		return nil, fmt.Errorf("unsupported protocol: %s", protocol)
+	}
+
+	// Set default TTL if not provided
+	if len(config.IP.TTL) == 0 {
+		config.IP.TTL = []string{"64"}
+	}
+
+	// Parse configurations with proper error handling
+	srcMACs, err := parseMACList(config.Ethernet.SrcMAC)
+	if err != nil {
+		return nil, fmt.Errorf("src MAC error: %v", err)
 	}
 
 	dstMACs, err := parseMACList(config.Ethernet.DstMAC)
 	if err != nil {
-		return nil, err
-	}
-	if len(dstMACs) == 0 {
-		// 使用默认目的 MAC 地址（广播地址）
-		dstMACs = append(dstMACs, net.HardwareAddr{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})
+		return nil, fmt.Errorf("dst MAC error: %v", err)
 	}
 
-	// Parse IP lists
 	srcIPRanges, err := parseIPList(config.IP.SrcIP)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing src_ip: %v", err)
+		return nil, fmt.Errorf("src IP error: %v", err)
 	}
+
 	dstIPRanges, err := parseIPList(config.IP.DstIP)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing dst_ip: %v", err)
+		return nil, fmt.Errorf("dst IP error: %v", err)
 	}
 
-	// Parse TTL list
 	ttlRanges, err := parseTTLList(config.IP.TTL)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing ttl: %v", err)
+		return nil, fmt.Errorf("TTL error: %v", err)
 	}
 
-	// Parse port lists if applicable
-	var srcPortRanges, dstPortRanges []Range
-	if strings.ToUpper(config.Transport.Protocol) == "TCP" || strings.ToUpper(config.Transport.Protocol) == "UDP" {
-		srcPortRanges, err = parsePortList(config.Transport.SrcPort)
-		if err != nil {
-			return nil, fmt.Errorf("error parsing src_port: %v", err)
-		}
-		dstPortRanges, err = parsePortList(config.Transport.DstPort)
-		if err != nil {
-			return nil, fmt.Errorf("error parsing dst_port: %v", err)
-		}
+	// Create and serialize packet
+	buffer := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{
+		FixLengths:       true,
+		ComputeChecksums: true,
 	}
 
-	// Randomly select Ethernet MAC addresses
-	srcMAC := srcMACs[rand.Intn(len(srcMACs))]
-	dstMAC := dstMACs[rand.Intn(len(dstMACs))]
-
-	// Randomly select IP addresses
-	srcIP := randomIP(srcIPRanges)
-	dstIP := randomIP(dstIPRanges)
-
-	// Randomly select TTL
-	ttl := randomTTL(ttlRanges)
-
-	// Create Ethernet layer
-	eth := layers.Ethernet{
-		SrcMAC:       srcMAC,
-		DstMAC:       dstMAC,
+	// Create layers
+	eth := &layers.Ethernet{
+		SrcMAC:       selectMAC(srcMACs),
+		DstMAC:       selectMAC(dstMACs),
 		EthernetType: layers.EthernetTypeIPv4,
 	}
 
-	// Create IP layer
-	ip := layers.IPv4{
-		Version: 4,
-		IHL:     5,
-		TTL:     ttl,
-		SrcIP:   srcIP,
-		DstIP:   dstIP,
+	ip := &layers.IPv4{
+		Version:  4,
+		IHL:      5,
+		TTL:      randomTTL(ttlRanges),
+		Protocol: getIPProtocol(protocol),
+		SrcIP:    randomIP(srcIPRanges),
+		DstIP:    randomIP(dstIPRanges),
 	}
 
-	// Create Transport layer
-	var transportLayer gopacket.SerializableLayer
-	switch strings.ToUpper(config.Transport.Protocol) {
+	// Create transport layer
+	transport, err := createTransportLayer(protocol, config, ip)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create payload
+	payloadLen := config.TotalSize - headerLen
+	payload := createPayload(payloadLen, config.Payload.Random)
+
+	// Serialize all layers
+	layers := []gopacket.SerializableLayer{eth, ip, transport, gopacket.Payload(payload)}
+	if err := gopacket.SerializeLayers(buffer, opts, layers...); err != nil {
+		return nil, fmt.Errorf("serialization error: %v", err)
+	}
+
+	return buffer.Bytes(), nil
+}
+
+// Helper functions
+
+func selectMAC(macs []net.HardwareAddr) net.HardwareAddr {
+	if len(macs) == 0 {
+		return net.HardwareAddr{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	}
+	return macs[rand.Intn(len(macs))]
+}
+
+func getIPProtocol(protocol string) layers.IPProtocol {
+	switch protocol {
 	case "TCP":
+		return layers.IPProtocolTCP
+	case "UDP":
+		return layers.IPProtocolUDP
+	case "ICMP":
+		return layers.IPProtocolICMPv4
+	default:
+		return layers.IPProtocolICMPv4
+	}
+}
+
+func createTransportLayer(protocol string, config Config, ip *layers.IPv4) (gopacket.SerializableLayer, error) {
+	var err error
+	switch protocol {
+	case "TCP":
+		var srcPortRanges, dstPortRanges []Range
+		if strings.ToUpper(config.Transport.Protocol) == "TCP" || strings.ToUpper(config.Transport.Protocol) == "UDP" {
+			srcPortRanges, err = parsePortList(config.Transport.SrcPort)
+			if err != nil {
+				return nil, fmt.Errorf("error parsing src_port: %v", err)
+			}
+			dstPortRanges, err = parsePortList(config.Transport.DstPort)
+			if err != nil {
+				return nil, fmt.Errorf("error parsing dst_port: %v", err)
+			}
+		}
 		if len(srcPortRanges) == 0 || len(dstPortRanges) == 0 {
 			return nil, errors.New("TCP protocol requires src_port and dst_port configurations")
 		}
@@ -343,9 +375,20 @@ func GenerateEthernetPacket(config Config) ([]byte, error) {
 			SYN:     true,
 			Window:  65535,
 		}
-		tcp.SetNetworkLayerForChecksum(&ip)
-		transportLayer = &tcp
+		tcp.SetNetworkLayerForChecksum(ip)
+		return &tcp, nil
 	case "UDP":
+		var srcPortRanges, dstPortRanges []Range
+		if strings.ToUpper(config.Transport.Protocol) == "TCP" || strings.ToUpper(config.Transport.Protocol) == "UDP" {
+			srcPortRanges, err = parsePortList(config.Transport.SrcPort)
+			if err != nil {
+				return nil, fmt.Errorf("error parsing src_port: %v", err)
+			}
+			dstPortRanges, err = parsePortList(config.Transport.DstPort)
+			if err != nil {
+				return nil, fmt.Errorf("error parsing dst_port: %v", err)
+			}
+		}
 		if len(srcPortRanges) == 0 || len(dstPortRanges) == 0 {
 			return nil, errors.New("UDP protocol requires src_port and dst_port configurations")
 		}
@@ -355,8 +398,8 @@ func GenerateEthernetPacket(config Config) ([]byte, error) {
 			SrcPort: layers.UDPPort(srcPort),
 			DstPort: layers.UDPPort(dstPort),
 		}
-		udp.SetNetworkLayerForChecksum(&ip)
-		transportLayer = &udp
+		udp.SetNetworkLayerForChecksum(ip)
+		return &udp, nil
 	case "ICMP":
 		if len(config.Transport.ICMPTypes) == 0 {
 			return nil, errors.New("ICMP protocol requires icmp_types configurations")
@@ -370,45 +413,20 @@ func GenerateEthernetPacket(config Config) ([]byte, error) {
 			Id:       1,
 			Seq:      1,
 		}
-		transportLayer = &icmp
+		return &icmp, nil
+	default:
+		return nil, fmt.Errorf("unsupported protocol: %s", protocol)
 	}
+}
 
-	// Create payload
-	var payload []byte
-	if config.Payload.Random {
-		payload = make([]byte, payloadLen)
+func createPayload(length int, random bool) []byte {
+	payload := make([]byte, length)
+	if random {
 		rand.Read(payload)
 	} else {
-		// 固定填充 'a' 字节
-		payload = make([]byte, payloadLen)
 		for i := range payload {
 			payload[i] = 'a'
 		}
 	}
-
-	// Create serialization buffer
-	buffer := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{
-		FixLengths:       true, // 自动修正长度字段
-		ComputeChecksums: true, // 自动计算校验和
-	}
-
-	// Assemble layers
-	var layersList []gopacket.SerializableLayer
-	layersList = append(layersList, &eth, &ip, transportLayer, gopacket.Payload(payload))
-
-	// Serialize layers
-	err = gopacket.SerializeLayers(buffer, opts, layersList...)
-	if err != nil {
-		return nil, fmt.Errorf("error serializing layers: %v", err)
-	}
-
-	packetData := buffer.Bytes()
-
-	// Verify total length
-	if len(packetData) != config.TotalSize {
-		return nil, fmt.Errorf("generated packet length %d does not match the specified total size %d", len(packetData), config.TotalSize)
-	}
-
-	return packetData, nil
+	return payload
 }

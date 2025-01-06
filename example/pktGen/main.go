@@ -46,7 +46,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error parsing config.yaml: %v", err)
 	}
-	headerSize := GetAllHeaderLength(config)
+	headerSize, err := GetAllHeaderLength(config)
+	if err != nil {
+		log.Fatalf("Error getting header size: %v", err)
+	}
 	sendCount := uint64(0)
 	totalCount := uint64(0)
 	wg := sync.WaitGroup{}
