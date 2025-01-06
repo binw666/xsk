@@ -140,19 +140,35 @@ func (xsk *ComplexXsk) PopulateFillRing(descs []XDPDesc) []XDPDesc {
 		freeSize = uint32(len(descs))
 	}
 	nb := XskRingProdReserve(&xsk.fill, freeSize, &pos)
+	descsLen := uint32(len(descs))
 	for i := uint32(0); i < nb; i++ {
-		*XskRingProdFillAddr(&xsk.fill, pos+i) = descs[i].Addr
+		*XskRingProdFillAddr(&xsk.fill, pos+i) = descs[descsLen-1-i].Addr
 	}
 	XskRingProdSubmit(&xsk.fill, nb)
-	leftDescs := make([]XDPDesc, len(descs)-int(nb))
-	copy(leftDescs, descs[nb:])
-	return leftDescs
+	return descs[:descsLen-nb]
 }
 
 func (xsk *ComplexXsk) RecycleRxRing() []XDPDesc {
 	pos := uint32(0)
 	nPkts := XskRingConsPeek(&xsk.rx, xsk.config.SocketConfig.RxSize, &pos)
 	descs := make([]XDPDesc, nPkts)
+	for i := uint32(0); i < nPkts; i++ {
+		desc := XskRingConsRxDesc(&xsk.rx, pos+i)
+		descs[i] = *desc
+	}
+	XskRingConsRelease(&xsk.rx, nPkts)
+	return descs
+}
+
+func (xsk *ComplexXsk) RecycleRxRingWithBuffer(buffer []XDPDesc) []XDPDesc {
+	pos := uint32(0)
+	nPkts := XskRingConsPeek(&xsk.rx, xsk.config.SocketConfig.RxSize, &pos)
+	var descs []XDPDesc
+	if nPkts > uint32(len(buffer)) {
+		descs = make([]XDPDesc, nPkts)
+	} else {
+		descs = buffer[:nPkts]
+	}
 	for i := uint32(0); i < nPkts; i++ {
 		desc := XskRingConsRxDesc(&xsk.rx, pos+i)
 		descs[i] = *desc
@@ -168,20 +184,35 @@ func (xsk *ComplexXsk) PopulateTxRing(descs []XDPDesc) []XDPDesc {
 		freeSize = uint32(len(descs))
 	}
 	nb := XskRingProdReserve(&xsk.tx, freeSize, &pos)
+	descsLen := uint32(len(descs))
 	for i := uint32(0); i < nb; i++ {
-		XskRingProdTxDesc(&xsk.tx, pos+i).Addr = descs[i].Addr
-		XskRingProdTxDesc(&xsk.tx, pos+i).Len = descs[i].Len
+		XskRingProdTxDesc(&xsk.tx, pos+i).Addr = descs[descsLen-1-i].Addr
+		XskRingProdTxDesc(&xsk.tx, pos+i).Len = descs[descsLen-1-i].Len
 	}
 	XskRingProdSubmit(&xsk.tx, nb)
-	leftDescs := make([]XDPDesc, len(descs)-int(nb))
-	copy(leftDescs, descs[nb:])
-	return leftDescs
+	return descs[:descsLen-nb]
 }
 
 func (xsk *ComplexXsk) RecycleCompRing() []XDPDesc {
 	pos := uint32(0)
 	nPkts := XskRingConsPeek(&xsk.comp, xsk.umem.Config.CompSize, &pos)
 	descs := make([]XDPDesc, nPkts)
+	for i := uint32(0); i < nPkts; i++ {
+		descs[i].Addr = *XskRingConsCompAddr(&xsk.comp, pos+i)
+	}
+	XskRingConsRelease(&xsk.comp, nPkts)
+	return descs
+}
+
+func (xsk *ComplexXsk) RecycleCompRingWithBuffer(buffer []XDPDesc) []XDPDesc {
+	pos := uint32(0)
+	nPkts := XskRingConsPeek(&xsk.comp, xsk.umem.Config.CompSize, &pos)
+	var descs []XDPDesc
+	if nPkts > uint32(len(buffer)) {
+		descs = make([]XDPDesc, nPkts)
+	} else {
+		descs = buffer[:nPkts]
+	}
 	for i := uint32(0); i < nPkts; i++ {
 		descs[i].Addr = *XskRingConsCompAddr(&xsk.comp, pos+i)
 	}

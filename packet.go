@@ -32,19 +32,18 @@ type Packet interface {
 // - tail:    表示数据结束的整数索引。
 type SimplePacket struct {
 	rawData PacketRawData
-	data    []byte
 	head    int
 	tail    int
 }
 
 // Data 返回数据包中有效的数据部分。数据不应被修改。
 func (p *SimplePacket) Data() []byte {
-	return p.data
+	return p.rawData[p.head:p.tail]
 }
 
 // Len 返回数据包的当前长度。
 func (p *SimplePacket) Len() int {
-	return len(p.data)
+	return p.tail - p.head
 }
 
 // SetData 将提供的数据复制到数据包并更新长度。
@@ -56,7 +55,6 @@ func (p *SimplePacket) SetData(data []byte) error {
 	copy(p.rawData[FrameHeadroom:], data)
 	p.head = FrameHeadroom
 	p.tail = FrameHeadroom + len(data)
-	p.data = p.rawData[p.head:p.tail]
 	return nil
 }
 
@@ -68,5 +66,4 @@ func (p *SimplePacket) SetData(data []byte) error {
 //	handler - 一个函数，接收指向 PacketRawData、head 和 tail 的指针，并对它们执行操作。
 func (p *SimplePacket) RunHandler(handler func(*PacketRawData, *int, *int)) {
 	handler(&p.rawData, &p.head, &p.tail)
-	p.data = p.rawData[p.head:p.tail]
 }
