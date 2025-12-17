@@ -12,15 +12,6 @@ import (
 	"github.com/google/gopacket/layers"
 )
 
-// Config 定义配置文件的结构
-type Config struct {
-	TotalSize int             `yaml:"total_size"`
-	Ethernet  EthernetConfig  `yaml:"ethernet"`
-	IP        IPConfig        `yaml:"ip"`
-	Transport TransportConfig `yaml:"transport"`
-	Payload   PayloadConfig   `yaml:"payload"`
-}
-
 type EthernetConfig struct {
 	SrcMAC []string `yaml:"src_mac"`
 	DstMAC []string `yaml:"dst_mac"`
@@ -42,11 +33,6 @@ type TransportConfig struct {
 type ICMPTypeCode struct {
 	Type int `yaml:"type"`
 	Code int `yaml:"code"`
-}
-
-type PayloadConfig struct {
-	Random    bool `yaml:"random"`
-	TimeStamp bool `yaml:"timestamp"`
 }
 
 // Utility Structures and Functions
@@ -213,7 +199,7 @@ func randomICMPTypeCode(icmpTypes []ICMPTypeCode) (layers.ICMPv4TypeCode, error)
 	return layers.CreateICMPv4TypeCode(uint8(selected.Type), uint8(selected.Code)), nil
 }
 
-func GetAllHeaderLength(config Config) (int, error) {
+func headerLengthForProtocol(protocol string) (int, error) {
 	const (
 		ethHeaderLen  = 14
 		ipHeaderLen   = 20
@@ -222,8 +208,7 @@ func GetAllHeaderLength(config Config) (int, error) {
 		icmpHeaderLen = 8
 	)
 
-	protocol := strings.ToUpper(config.Transport.Protocol)
-	switch protocol {
+	switch strings.ToUpper(protocol) {
 	case "TCP":
 		return ethHeaderLen + ipHeaderLen + tcpHeaderLen, nil
 	case "UDP":
@@ -235,53 +220,61 @@ func GetAllHeaderLength(config Config) (int, error) {
 	}
 }
 
-func GenerateEthernetPacket(config Config) ([]byte, error) {
+type BuiltPacket struct {
+	Bytes         []byte
+	PayloadOffset int
+	// SendNsOffset is the absolute byte offset of the 8-byte sendNs field inside Bytes.
+	// -1 means timestamp header not present.
+	SendNsOffset int
+}
+
+func BuildPacket(flow FlowConfig, payload PayloadSpec) (BuiltPacket, error) {
 	// Validate minimum packet size
-	headerLen, err := GetAllHeaderLength(config)
+	headerLen, err := headerLengthForProtocol(flow.Transport.Protocol)
 	if err != nil {
-		return nil, err
+		return BuiltPacket{}, err
 	}
 
-	if config.TotalSize < headerLen {
-		return nil, fmt.Errorf("total size %d is too small (minimum required: %d)",
-			config.TotalSize, headerLen)
+	if flow.TotalSize < headerLen {
+		return BuiltPacket{}, fmt.Errorf("total size %d is too small (minimum required: %d)",
+			flow.TotalSize, headerLen)
 	}
 
 	// Validate protocol
-	protocol := strings.ToUpper(config.Transport.Protocol)
+	protocol := strings.ToUpper(flow.Transport.Protocol)
 	if protocol != "TCP" && protocol != "UDP" && protocol != "ICMP" {
-		return nil, fmt.Errorf("unsupported protocol: %s", protocol)
+		return BuiltPacket{}, fmt.Errorf("unsupported protocol: %s", protocol)
 	}
 
 	// Set default TTL if not provided
-	if len(config.IP.TTL) == 0 {
-		config.IP.TTL = []string{"64"}
+	if len(flow.IP.TTL) == 0 {
+		flow.IP.TTL = []string{"64"}
 	}
 
 	// Parse configurations with proper error handling
-	srcMACs, err := parseMACList(config.Ethernet.SrcMAC)
+	srcMACs, err := parseMACList(flow.Ethernet.SrcMAC)
 	if err != nil {
-		return nil, fmt.Errorf("src MAC error: %v", err)
+		return BuiltPacket{}, fmt.Errorf("src MAC error: %v", err)
 	}
 
-	dstMACs, err := parseMACList(config.Ethernet.DstMAC)
+	dstMACs, err := parseMACList(flow.Ethernet.DstMAC)
 	if err != nil {
-		return nil, fmt.Errorf("dst MAC error: %v", err)
+		return BuiltPacket{}, fmt.Errorf("dst MAC error: %v", err)
 	}
 
-	srcIPRanges, err := parseIPList(config.IP.SrcIP)
+	srcIPRanges, err := parseIPList(flow.IP.SrcIP)
 	if err != nil {
-		return nil, fmt.Errorf("src IP error: %v", err)
+		return BuiltPacket{}, fmt.Errorf("src IP error: %v", err)
 	}
 
-	dstIPRanges, err := parseIPList(config.IP.DstIP)
+	dstIPRanges, err := parseIPList(flow.IP.DstIP)
 	if err != nil {
-		return nil, fmt.Errorf("dst IP error: %v", err)
+		return BuiltPacket{}, fmt.Errorf("dst IP error: %v", err)
 	}
 
-	ttlRanges, err := parseTTLList(config.IP.TTL)
+	ttlRanges, err := parseTTLList(flow.IP.TTL)
 	if err != nil {
-		return nil, fmt.Errorf("TTL error: %v", err)
+		return BuiltPacket{}, fmt.Errorf("TTL error: %v", err)
 	}
 
 	// Create and serialize packet
@@ -308,22 +301,36 @@ func GenerateEthernetPacket(config Config) ([]byte, error) {
 	}
 
 	// Create transport layer
-	transport, err := createTransportLayer(protocol, config, ip)
+	transport, err := createTransportLayer(protocol, flow, ip)
 	if err != nil {
-		return nil, err
+		return BuiltPacket{}, err
 	}
 
 	// Create payload
-	payloadLen := config.TotalSize - headerLen
-	payload := createPayload(payloadLen, config.Payload.Random)
+	payloadLen := flow.TotalSize - headerLen
+	payloadBytes := createPayload(payloadLen, payload.Random)
 
 	// Serialize all layers
-	layers := []gopacket.SerializableLayer{eth, ip, transport, gopacket.Payload(payload)}
-	if err := gopacket.SerializeLayers(buffer, opts, layers...); err != nil {
-		return nil, fmt.Errorf("serialization error: %v", err)
+	serialLayers := []gopacket.SerializableLayer{eth, ip, transport, gopacket.Payload(payloadBytes)}
+	if err := gopacket.SerializeLayers(buffer, opts, serialLayers...); err != nil {
+		return BuiltPacket{}, fmt.Errorf("serialization error: %v", err)
 	}
 
-	return buffer.Bytes(), nil
+	pkt := buffer.Bytes()
+	payloadOffset := headerLen
+	sendNsOffset := -1
+	if payload.TimeStamp.Enable {
+		if payloadLen < payload.TimeStamp.Offset+tsHeaderLen {
+			return BuiltPacket{}, fmt.Errorf("timestamp enabled but payload too small: need >= %d bytes, got %d",
+				payload.TimeStamp.Offset+tsHeaderLen, payloadLen)
+		}
+		if off, ok := writeTimestampHeader(pkt, payloadOffset, payload.TimeStamp); ok {
+			sendNsOffset = off
+		} else {
+			return BuiltPacket{}, fmt.Errorf("failed to write timestamp header (payloadOffset=%d)", payloadOffset)
+		}
+	}
+	return BuiltPacket{Bytes: pkt, PayloadOffset: payloadOffset, SendNsOffset: sendNsOffset}, nil
 }
 
 // Helper functions
@@ -348,17 +355,17 @@ func getIPProtocol(protocol string) layers.IPProtocol {
 	}
 }
 
-func createTransportLayer(protocol string, config Config, ip *layers.IPv4) (gopacket.SerializableLayer, error) {
+func createTransportLayer(protocol string, flow FlowConfig, ip *layers.IPv4) (gopacket.SerializableLayer, error) {
 	var err error
 	switch protocol {
 	case "TCP":
 		var srcPortRanges, dstPortRanges []Range
-		if strings.ToUpper(config.Transport.Protocol) == "TCP" || strings.ToUpper(config.Transport.Protocol) == "UDP" {
-			srcPortRanges, err = parsePortList(config.Transport.SrcPort)
+		if strings.ToUpper(flow.Transport.Protocol) == "TCP" || strings.ToUpper(flow.Transport.Protocol) == "UDP" {
+			srcPortRanges, err = parsePortList(flow.Transport.SrcPort)
 			if err != nil {
 				return nil, fmt.Errorf("error parsing src_port: %v", err)
 			}
-			dstPortRanges, err = parsePortList(config.Transport.DstPort)
+			dstPortRanges, err = parsePortList(flow.Transport.DstPort)
 			if err != nil {
 				return nil, fmt.Errorf("error parsing dst_port: %v", err)
 			}
@@ -379,12 +386,12 @@ func createTransportLayer(protocol string, config Config, ip *layers.IPv4) (gopa
 		return &tcp, nil
 	case "UDP":
 		var srcPortRanges, dstPortRanges []Range
-		if strings.ToUpper(config.Transport.Protocol) == "TCP" || strings.ToUpper(config.Transport.Protocol) == "UDP" {
-			srcPortRanges, err = parsePortList(config.Transport.SrcPort)
+		if strings.ToUpper(flow.Transport.Protocol) == "TCP" || strings.ToUpper(flow.Transport.Protocol) == "UDP" {
+			srcPortRanges, err = parsePortList(flow.Transport.SrcPort)
 			if err != nil {
 				return nil, fmt.Errorf("error parsing src_port: %v", err)
 			}
-			dstPortRanges, err = parsePortList(config.Transport.DstPort)
+			dstPortRanges, err = parsePortList(flow.Transport.DstPort)
 			if err != nil {
 				return nil, fmt.Errorf("error parsing dst_port: %v", err)
 			}
@@ -401,10 +408,10 @@ func createTransportLayer(protocol string, config Config, ip *layers.IPv4) (gopa
 		udp.SetNetworkLayerForChecksum(ip)
 		return &udp, nil
 	case "ICMP":
-		if len(config.Transport.ICMPTypes) == 0 {
+		if len(flow.Transport.ICMPTypes) == 0 {
 			return nil, errors.New("ICMP protocol requires icmp_types configurations")
 		}
-		icmpTypeCode, err := randomICMPTypeCode(config.Transport.ICMPTypes)
+		icmpTypeCode, err := randomICMPTypeCode(flow.Transport.ICMPTypes)
 		if err != nil {
 			return nil, fmt.Errorf("error selecting ICMP type/code: %v", err)
 		}

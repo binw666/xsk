@@ -1,0 +1,42 @@
+templates_per_flow: 256
+
+# 默认payload配置；flow内可覆盖
+payload:
+  random: true
+  timestamp:
+    enable: true
+    offset: 0
+    magic: "XSKT"
+
+flows:
+  - name: udp_53
+    weight: 3
+    total_size: 128
+    ethernet:
+      src_mac: ["00:0C:29:3E:1A:2B"]
+      dst_mac: ["FF:FF:FF:FF:FF:FF"]
+    ip:
+      ttl: ["64"]
+      src_ip: ["10.0.0.1-10.0.0.254"]
+      dst_ip: ["10.0.0.2"]
+    transport:
+      protocol: "UDP"
+      src_port: ["1024-65535"]
+      dst_port: ["53"]
+
+  - name: icmp_echo
+    weight: 1
+    total_size: 128
+    ethernet:
+      src_mac: ["00:0C:29:3E:1A:2B"]
+      dst_mac: ["FF:FF:FF:FF:FF:FF"]
+    ip:
+      ttl: ["64"]
+      src_ip: ["10.0.0.1-10.0.0.254"]
+      dst_ip: ["10.0.0.2"]
+    transport:
+      protocol: "ICMP"
+      icmp_types:
+        - type: 8
+          code: 0
+
